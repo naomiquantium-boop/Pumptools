@@ -899,25 +899,31 @@ async def broadcast_buy(app: Application, text: str) -> None:
             pass
 
 # -------------------- HEALTHCHECK --------------------
+# Railway doesn't require an HTTP server for Telegram polling bots.
+# But if you want a health endpoint, we run Flask in a *separate thread*
+# so it never blocks the asyncio event loop used by python-telegram-bot.
 flask_app = Flask(__name__)
 
 @flask_app.get("/")
 def health():
     return "ok", 200
 
-async def _run_flask() -> None:
+def start_health_server() -> None:
     port = int(os.getenv("PORT", "8080"))
     flask_app.run(host="0.0.0.0", port=port)
 
 # -------------------- APP INIT --------------------
 async def post_init(app: Application) -> None:
     load_all()
-    # background tasks
-    app.create_task(buy_poller(app))
-    app.create_task(poll_payments(app))
-    app.create_task(leaderboard_loop(app))
-    # run flask in executor-like task
-    app.create_task(_run_flask())
+    # background tasks (create on the running loop, not via PTB's create_task)
+    loop = asyncio.get_running_loop()
+    loop.create_task(buy_poller(app))
+    loop.create_task(poll_payments(app))
+    loop.create_task(leaderboard_loop(app))
+
+    # health server in a daemon thread (non-blocking)
+    import threading
+    threading.Thread(target=start_health_server, daemon=True).start()
 
 def main() -> None:
     if not BOT_TOKEN:
