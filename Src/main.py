@@ -423,9 +423,12 @@ async def main():
     tg_app.add_handler(CallbackQueryHandler(on_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message))
 
-    # start telegram + background loops
+    # start telegram + polling
+    # NOTE: Application.start() does NOT start receiving updates by itself.
+    # We must start polling (or set a Telegram webhook). For Railway, polling is simplest.
     await tg_app.initialize()
     await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
 
     # start background tasks
     tg_app.create_task(leaderboard_loop(tg_app))
