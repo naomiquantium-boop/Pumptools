@@ -20,6 +20,7 @@ log = logging.getLogger("spysol_buybot")
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 # Solana / Helius
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
@@ -597,26 +598,310 @@ def save_groups() -> None:
     _save_json(GROUPS_FILE, GROUPS)
 
 # -------------------- TELEGRAM COMMANDS --------------------
+def build_deeplink(param: str) -> str:
+    # param is appended to start=... to open bot DM
+    if BOT_USERNAME:
+        return f"https://t.me/{BOT_USERNAME}?start={param}"
+    return ""
+
+def build_startgroup() -> str:
+    if BOT_USERNAME:
+        return f"https://t.me/{BOT_USERNAME}?startgroup=1"
+    return ""
+
 def start_text() -> str:
     return (
-        "🤖 SpySOL BuyBot\n\n"
-        "Commands:\n"
-        "• /tokens — list tracked tokens\n"
-        "• /trending — book trending (paid)\n"
-        "• /ads — book ads under buy posts\n\n"
-        "Owner:\n"
-        "• /addtoken <mint> <SYMBOL> <Name...>\n"
-        "• /deltoken <mint>\n"
-        "• /adset * <text> | <link>\n"
-        "• /adsettoken <mint> <text> | <link>\n"
-        "• /adclear <mint|*>\n"
+        "🎩 Welcome to the Major-Style Buy Bot! 🎩
+
+"
+        "To enjoy the benefits of the fastest Buy Notifications, Premium Trending, and Community Trending, "
+        "please add the bot to your group and follow the instructions.
+
+"
+        "Note: Bot must be an Admin with write permissions. If no confirmation message appears after adding the bot "
+        "to your community chat, simply type /continue in your group.
+
+"
+        f"Trending: {TRENDING_URL}
+"
+        f"Listing: {LISTING_URL}"
     )
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Handle deep-link flows (DM)
+    if context.args:
+        arg0 = context.args[0].strip()
+        if arg0.startswith("continue_"):
+            gid = arg0.split("_",1)[1]
+            context.user_data["setup_group_id"] = gid
+            context.user_data["awaiting_ca"] = True
+            await update.effective_message.reply_text("➤ Send your SOL Contract Address:")
+            return
+
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add me to your Group", url=build_startgroup())],
         [InlineKeyboardButton("Trending Channel", url=TRENDING_URL), InlineKeyboardButton("Listing", url=LISTING_URL)],
     ])
     await update.effective_message.reply_text(start_text(), reply_markup=kb, disable_web_page_preview=True)
+
+
+async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    # If used inside group: send button that opens DM with deep link carrying group id
+    if chat.type in ("group","supergroup"):
+        link = build_deeplink(f"continue_{chat.id}")
+        if not link:
+            await update.effective_message.reply_text("Set BOT_USERNAME env var to enable the continue link.")
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Click here to continue!", url=link)]])
+        await update.effective_message.reply_text("✅ Setup: Click below to continue in DM.", reply_markup=kb)
+        return
+
+    # If used in DM with an argument: /continue -100123...
+    if context.args:
+        gid = context.args[0]
+        context.user_data["setup_group_id"] = gid
+        context.user_data["awaiting_ca"] = True
+        await update.effective_message.reply_text("➤ Send your SOL Contract Address:")
+        return
+
+    await update.effective_message.reply_text("Use /continue in your group (recommended), or /continue <group_id> in DM.")
+
+# -------------------- SETUP / UI FLOW --------------------
+def _group_token_settings(group_id: str, mint: str) -> Dict[str, Any]:
+    g = GROUPS.setdefault(str(group_id), {"enabled": True})
+    tmap = g.setdefault("tokens", {})
+    s = tmap.get(mint)
+    if not s:
+        s = {
+            "emoji": "🎩",
+            "min_buy_usd": 0.0,
+            "buy_steps": [15, 50, 100],
+            "show_media": True,
+            "show_chart": True,
+            "show_notifications": True,
+            "show_socials": True,
+        }
+        tmap[mint] = s
+        save_groups()
+    return s
+
+def _settings_keyboard(mint: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Emoji (🎩)", callback_data=f"cfg|{mint}|emoji"),
+         InlineKeyboardButton("Total Supply", callback_data=f"cfg|{mint}|supply")],
+        [InlineKeyboardButton("Min. Buy ($15)", callback_data=f"cfg|{mint}|minbuy"),
+         InlineKeyboardButton("Buy Steps ($15)", callback_data=f"cfg|{mint}|steps")],
+        [InlineKeyboardButton("✅ Media", callback_data=f"cfg|{mint}|media"),
+         InlineKeyboardButton("📊 Chart", callback_data=f"cfg|{mint}|chart")],
+        [InlineKeyboardButton("🔔 Notifications", callback_data=f"cfg|{mint}|notif"),
+         InlineKeyboardButton("🌐 Socials", callback_data=f"cfg|{mint}|socials")],
+        [InlineKeyboardButton("🗑️ Delete Token", callback_data=f"cfg|{mint}|delete"),
+         InlineKeyboardButton("⬅️ Back", callback_data="cfg|back|0")],
+    ])
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    txt = msg.text.strip()
+
+    # Setting value input
+    awaiting = context.user_data.get("awaiting_setting")
+    if awaiting:
+        kind, mint = awaiting.get("kind"), awaiting.get("mint")
+        gid = awaiting.get("group_id")
+        if kind == "emoji":
+            _group_token_settings(gid, mint)["emoji"] = txt[:6]
+            save_groups()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Emoji updated.", reply_markup=_settings_keyboard(mint))
+            return
+        if kind == "minbuy":
+            try:
+                val = float(txt.replace("$","").strip())
+            except Exception:
+                await msg.reply_text("Send a number like 15")
+                return
+            _group_token_settings(gid, mint)["min_buy_usd"] = val
+            save_groups()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Min buy updated.", reply_markup=_settings_keyboard(mint))
+            return
+        if kind == "steps":
+            # comma separated
+            parts=[p.strip() for p in txt.replace("$","").split(",") if p.strip()]
+            try:
+                vals=[float(p) for p in parts]
+            except Exception:
+                await msg.reply_text("Send values like: 15,50,100")
+                return
+            _group_token_settings(gid, mint)["buy_steps"] = vals
+            save_groups()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Buy steps updated.", reply_markup=_settings_keyboard(mint))
+            return
+        if kind == "socials":
+            # format: tg=<url> website=<url> x=<url>
+            t = TOKENS.get(mint) or {}
+            for part in txt.split():
+                if "=" not in part: 
+                    continue
+                k,v = part.split("=",1)
+                k=k.lower().strip()
+                v=v.strip()
+                if k in ("tg","telegram"):
+                    t["telegram"]=v
+                elif k in ("x","twitter"):
+                    t["twitter"]=v
+                elif k in ("web","website"):
+                    t["website"]=v
+            TOKENS[mint]=t
+            save_tokens()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint))
+            return
+
+    # Setup flow: contract address input
+    if context.user_data.get("awaiting_ca"):
+        mint = txt
+        # basic Solana mint check (base58-ish length)
+        if len(mint) < 30 or len(mint) > 50:
+            await msg.reply_text("That doesn't look like a Solana mint. Send the SOL Contract Address again.")
+            return
+        try:
+            pairs = dexscreener_token_pairs(mint)
+        except Exception:
+            pairs = []
+        if not pairs:
+            await msg.reply_text("No pairs found for that mint. Try another contract address.")
+            return
+
+        # store candidates in user_data, show top 6 by volume
+        def vol24(p):
+            try: return float((p.get("volume") or {}).get("h24") or 0)
+            except Exception: return 0.0
+        pairs_sorted = sorted(pairs, key=vol24, reverse=True)[:6]
+        context.user_data["pair_candidates"] = pairs_sorted
+        context.user_data["pending_mint"] = mint
+        context.user_data["awaiting_ca"] = False
+
+        buttons=[]
+        for i,p in enumerate(pairs_sorted):
+            base = (p.get("baseToken") or {}).get("symbol") or "TOKEN"
+            quote = (p.get("quoteToken") or {}).get("symbol") or ""
+            dex = (p.get("dexId") or "").replace("-", " ").title() or "DEX"
+            v = vol24(p)
+            label=f"{base} - {quote} - ({dex} V: {fmt_num(v,1)})"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"pair|{i}")])
+        buttons.append([InlineKeyboardButton("Back", callback_data="pair|back")])
+        await msg.reply_text("➤ Match found! Confirm your pair below:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    await q.answer()
+
+    # Pair selection
+    if data.startswith("pair|"):
+        if data == "pair|back":
+            context.user_data["awaiting_ca"] = True
+            await q.edit_message_text("➤ Send your SOL Contract Address:")
+            return
+        try:
+            idx = int(data.split("|",1)[1])
+        except Exception:
+            return
+        pairs = context.user_data.get("pair_candidates") or []
+        if idx < 0 or idx >= len(pairs):
+            return
+        p = pairs[idx]
+        mint = context.user_data.get("pending_mint")
+        if not mint:
+            return
+        base = (p.get("baseToken") or {})
+        symbol = base.get("symbol") or "TOKEN"
+        name = base.get("name") or symbol
+        pair_addr = p.get("pairAddress") or ""
+        url = p.get("url") or f"https://dexscreener.com/solana/{mint}"
+
+        # attach to group (from deep link)
+        gid = str(context.user_data.get("setup_group_id") or "")
+        if not gid:
+            gid = "0"
+
+        TOKENS[mint] = {
+            "mint": mint,
+            "symbol": symbol,
+            "name": name,
+            "watch_address": pair_addr or "",
+            "chart": url,
+            "telegram": "",
+            "decimals": 9,
+        }
+        save_tokens()
+        _group_token_settings(gid, mint)
+
+        await q.edit_message_text("⚙️ Settings\n\nChoose from the following options to customize your Buy Bot:", reply_markup=_settings_keyboard(mint))
+        return
+
+    # Settings menu
+    if data.startswith("cfg|"):
+        parts = data.split("|")
+        if len(parts) < 3:
+            return
+        mint = parts[1]
+        action = parts[2]
+        gid = str(context.user_data.get("setup_group_id") or "0")
+
+        if action == "emoji":
+            context.user_data["awaiting_setting"] = {"kind":"emoji","mint":mint,"group_id":gid}
+            await q.edit_message_text("Send the emoji you want (example: 🎩)")
+            return
+        if action == "minbuy":
+            context.user_data["awaiting_setting"] = {"kind":"minbuy","mint":mint,"group_id":gid}
+            await q.edit_message_text("Send the minimum buy in USD (example: 15)")
+            return
+        if action == "steps":
+            context.user_data["awaiting_setting"] = {"kind":"steps","mint":mint,"group_id":gid}
+            await q.edit_message_text("Send buy steps as comma-separated USD values (example: 15,50,100)")
+            return
+        if action in ("media","chart","notif"):
+            s=_group_token_settings(gid, mint)
+            key={"media":"show_media","chart":"show_chart","notif":"show_notifications"}[action]
+            s[key]=not bool(s.get(key, True))
+            save_groups()
+            await q.edit_message_reply_markup(reply_markup=_settings_keyboard(mint))
+            return
+        if action == "socials":
+            context.user_data["awaiting_setting"] = {"kind":"socials","mint":mint,"group_id":gid}
+            await q.edit_message_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name")
+            return
+        if action == "delete":
+            # Remove token from TOKENS and group mapping
+            TOKENS.pop(mint, None)
+            save_tokens()
+            g = GROUPS.get(gid) or {}
+            tmap = g.get("tokens") or {}
+            tmap.pop(mint, None)
+            if "tokens" in g:
+                g["tokens"]=tmap
+            GROUPS[gid]=g
+            save_groups()
+            await q.edit_message_text("🗑️ Token deleted.")
+            return
+        if action == "supply":
+            await q.edit_message_text("Total supply is auto (coming soon).", reply_markup=_settings_keyboard(mint))
+            return
+        if action == "0":
+            await q.edit_message_text(start_text())
+            return
 
 async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not TOKENS:
@@ -836,11 +1121,9 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # -------------------- GROUP ACTIVITY --------------------
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # store groups where bot is admin
+    # When the bot is added to a group, store group and post "continue" button like Major Buy Bot.
     chat = update.effective_chat
-    if not chat:
-        return
-    if chat.type not in ("group","supergroup"):
+    if not chat or chat.type not in ("group","supergroup"):
         return
     member = update.my_chat_member
     if not member:
@@ -849,6 +1132,21 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if status in ("member","administrator"):
         GROUPS[str(chat.id)] = {"enabled": True}
         save_groups()
+
+        link = build_deeplink(f"continue_{chat.id}")
+        if link:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Click here to continue!", url=link)]])
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="✅ Buy Bot added to the group successfully!",
+                reply_markup=kb
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="✅ Buy Bot added to the group successfully! Type /continue to continue setup."
+            )
+
 
 # -------------------- BUY POLLER --------------------
 async def buy_poller(app: Application) -> None:
@@ -915,6 +1213,12 @@ def start_health_server() -> None:
 # -------------------- APP INIT --------------------
 async def post_init(app: Application) -> None:
     load_all()
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            BOT_USERNAME = (await app.bot.get_me()).username or ""
+        except Exception:
+            BOT_USERNAME = BOT_USERNAME or ""
     # background tasks (create on the running loop, not via PTB's create_task)
     loop = asyncio.get_running_loop()
     loop.create_task(buy_poller(app))
@@ -929,9 +1233,16 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is required.")
     load_all()
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            BOT_USERNAME = (await app.bot.get_me()).username or ""
+        except Exception:
+            BOT_USERNAME = BOT_USERNAME or ""
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
@@ -942,6 +1253,8 @@ def main() -> None:
     application.add_handler(CommandHandler("trending", cmd_trending))
     application.add_handler(CommandHandler("ads", cmd_ads))
     application.add_handler(CommandHandler("confirm", cmd_confirm))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     application.run_polling(close_loop=False)
