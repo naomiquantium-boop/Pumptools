@@ -610,22 +610,17 @@ def build_startgroup() -> str:
     return ""
 
 def start_text() -> str:
+    # Keep this as a single valid string (Railway will crash if a quote is left open).
     return (
-        "🎩 Welcome to the Major-Style Buy Bot! 🎩
-
-"
+        "🎩 Welcome to the Major Buy Bot! 🎩\n\n"
         "To enjoy the benefits of the fastest Buy Notifications, Premium Trending, and Community Trending, "
-        "please add the bot to your group and follow the instructions.
-
-"
+        "please add the bot to your group and follow the instructions.\n\n"
         "Note: Bot must be an Admin with write permissions. If no confirmation message appears after adding the bot "
-        "to your community chat, simply type /continue in your group.
-
-"
-        f"Trending: {TRENDING_URL}
-"
+        "to your community chat, simply type /continue in your group!\n\n"
+        f"Trending: {TRENDING_URL}\n"
         f"Listing: {LISTING_URL}"
     )
+
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1232,13 +1227,9 @@ async def post_init(app: Application) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is required.")
-    load_all()
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        try:
-            BOT_USERNAME = (await app.bot.get_me()).username or ""
-        except Exception:
-            BOT_USERNAME = BOT_USERNAME or ""
+
+    # Build PTB Application. Any async initialization (e.g., fetching bot username)
+    # is done inside post_init().
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1258,6 +1249,7 @@ def main() -> None:
     application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     application.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
