@@ -1,10 +1,10 @@
-# PumpTools BuyBot v1 (BuyBot + Trending + Ads)
+# SpySOL BuyBot (Solana + Pump.fun style)
 
-This is the **PumpTools** Telegram bot for **Solana** tokens.
+This is a Telegram BuyBot similar to SpyTON, but for **Solana** tokens.  
 It can:
 - Post buy alerts in **groups**
 - Mirror buy alerts into your **trending channel**
-- Provide **/trending** (Top 3 / Top 10) and **/ads** booking in the same bot (paid in SOL)
+- Provide **/trending** and **/ads** booking in the same bot (paid in SOL)
 - Maintain a **leaderboard** message in your trending channel
 
 ## How buys are detected (important)
@@ -21,7 +21,7 @@ Then the bot looks for SWAP events where SOL is input and the token mint is outp
 Required:
 - `BOT_TOKEN` = Telegram bot token
 - `HELIUS_API_KEY` = Helius API key (mainnet)
-- `PAY_WALLET` = Solana wallet address to receive booking payments (defaults to PumpTools wallet)
+- `PAY_WALLET` = Solana wallet address to receive booking payments
 
 Recommended:
 - `TRENDING_POST_CHAT_ID` = numeric id of your trending channel (example: `-1001234567890`)
@@ -29,10 +29,9 @@ Recommended:
 - `OWNER_IDS` = comma separated Telegram user ids (admins) e.g. `123,456`
 - `DATA_DIR` = `/data` (Railway volume mount recommended)
 
-Pricing (defaults match your screenshots):
-- `TOP3_PRICES` default: `2h=0.14,3h=0.73,6h=1.47,12h=2.03,24h=2.92`
-- `TOP10_PRICES` default: `3h=0.46,6h=1.09,12h=1.37,24h=2.19`
-- `ADS_PACKAGES` default: `6h=1,12h=1.5,24h=3`
+Pricing:
+- `TRENDING_PRICES` default: `1h=0.2,6h=0.8,24h=2.5`
+- `ADS_PRICES` default: `1d=0.5,3d=1.2,7d=2.5`
 
 Leaderboard:
 - `LEADERBOARD_ON` = `1`
