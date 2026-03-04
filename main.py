@@ -779,9 +779,8 @@ async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int
     Stores the reference in LEADERBOARD_MSG_FILE so we edit the same message (no spam)."""
     if not TRENDING_POST_CHAT_ID:
         return None
-    try:
-        chat_id = int(TRENDING_POST_CHAT_ID)
-    except Exception:
+    chat_id = await get_trending_chat_id(app)
+    if not chat_id:
         return None
 
     # If we already have a message id, use it
@@ -851,6 +850,40 @@ async def leaderboard_loop(app: Application) -> None:
             log.warning("leaderboard_loop error: %s", e)
         await asyncio.sleep(LEADERBOARD_INTERVAL)
 
+
+
+# -------------------- CHAT ID RESOLUTION --------------------
+_TRENDING_CHAT_ID_CACHE: Optional[int] = None
+
+async def resolve_chat_id(app: Application, chat_ref: Any) -> Optional[int]:
+    """Resolve chat id from an int-like value or @username / t.me link."""
+    if chat_ref is None:
+        return None
+    try:
+        return int(chat_ref)
+    except Exception:
+        pass
+    s = str(chat_ref).strip()
+    if not s:
+        return None
+    if "t.me/" in s:
+        s = s.split("t.me/")[-1].split("/")[0]
+        s = "@" + s.lstrip("@")
+    if s.startswith("@"):
+        try:
+            chat = await app.bot.get_chat(s)
+            return int(chat.id)
+        except Exception:
+            return None
+    return None
+
+async def get_trending_chat_id(app: Application) -> Optional[int]:
+    global _TRENDING_CHAT_ID_CACHE
+    if _TRENDING_CHAT_ID_CACHE:
+        return _TRENDING_CHAT_ID_CACHE
+    cid = await resolve_chat_id(app, TRENDING_POST_CHAT_ID)
+    _TRENDING_CHAT_ID_CACHE = cid
+    return cid
 # -------------------- CONFIG LOAD --------------------
 def load_all() -> None:
     global TOKENS, GROUPS, SEEN, ADS, BOOKINGS, INVOICES, LEADERBOARD_MSG
@@ -1069,6 +1102,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         pass
 
+    # ----- Copy helpers for payments -----
+    if data.startswith("copy|"):
+        try:
+            _, what, inv_id = data.split("|", 2)
+        except Exception:
+            return
+        if what == "wallet":
+            await q.message.reply_text(f"<pre>{html.escape(PAY_WALLET)}</pre>", parse_mode="HTML", disable_web_page_preview=True)
+        elif what == "ref":
+            await q.message.reply_text(f"<pre>{html.escape(inv_id)}</pre>", parse_mode="HTML", disable_web_page_preview=True)
+        return
+
     # ----- Pair selection during setup -----
     if data.startswith("pair|"):
         _, arg = data.split("|", 1)
@@ -1104,7 +1149,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "name": name,
             "pair": pair_addr,
             "chart": f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}",
-            "watch_address": (TOKENS.get(mint) or {}).get("watch_address", ""),
+            "watch_address": (pair_addr or (TOKENS.get(mint) or {}).get("watch_address", "")),
             "kind": "solana",
         }
         save_tokens()
@@ -1342,20 +1387,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         inv = _mk_invoice_ref("trending", mint, dur, price, update.effective_chat.id, update.effective_user.id)
         sym = TOKENS.get(mint, {}).get("symbol") or "TOKEN"
         slot = flow.get("slot", "top10")
-        summary = (
-            "✅ Order Summary\n\n"
-            f"Token: ${sym}\n"
-            f"Slot: {'Top 3' if slot=='top3' else 'Top 10'}\n"
-            f"Duration: {dur}\n"
-            f"Price: {price} SOL\n\n"
-            f"Pay to (Solana):\n{PAY_WALLET}\n\n"
-            f"Reference: {inv['id']}\n"
+        summary_html = (
+            "✅ <b>Order Summary</b>\n\n"
+            f"Token: <b>${html.escape(sym)}</b>\n"
+            f"Slot: <b>{'Top 3' if slot=='top3' else 'Top 10'}</b>\n"
+            f"Duration: <b>{html.escape(dur)}</b>\n"
+            f"Price: <b>{price} SOL</b>\n\n"
+            "Pay to (Solana):\n"
+            f"<pre>{html.escape(PAY_WALLET)}</pre>\n"
+            "Reference:\n"
+            f"<pre>{html.escape(inv['id'])}</pre>\n"
             "(Include this reference in the transfer note/memo)\n\n"
-            "After payment tap: ✅ I Paid"
+            "After payment tap: ✅ <b>I Paid</b>"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")],
+            [InlineKeyboardButton("📋 Wallet", callback_data=f"copy|wallet|{inv['id']}"), InlineKeyboardButton("📋 Reference", callback_data=f"copy|ref|{inv['id']}")],
+        ])
         context.user_data.pop("awaiting_booking_mint", None)
-        await msg.reply_text(f"<pre>{html.escape(summary)}</pre>", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await msg.reply_text(summary_html, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
 
     if context.user_data.get("awaiting_ad_content"):
@@ -1402,7 +1452,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "After payment tap: ✅ I Paid"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")]])
-        await msg.reply_text(f"<pre>{html.escape(summary)}</pre>", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await msg.reply_text(summary_html, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
     txt = msg.text.strip()
 
@@ -1479,7 +1529,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             TOKENS[mint] = t
             save_tokens()
             context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint))
+            await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
             return
 
         if kind == "supply":
@@ -1805,18 +1855,24 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text("Invalid duration.\n\nAvailable:\n" + _pricing_text("ads"))
             return
         inv = _mk_invoice_ref("ads", mint, dur, float(price), update.effective_chat.id, update.effective_user.id)
-        await update.effective_message.reply_text(
+        sym = TOKENS.get(mint, {}).get("symbol") or "TOKEN"
+        summary_html = (
             "📣 <b>Ads booking</b>\n\n"
-            f"Token: <code>{mint}</code>\n"
-            f"Duration: <b>{dur}</b>\n"
+            f"Token: <b>${html.escape(sym)}</b>\n"
+            f"Duration: <b>{html.escape(dur)}</b>\n"
             f"Price: <b>{price} SOL</b>\n\n"
-            f"Send <b>{price} SOL</b> to:\n<code>{PAY_WALLET}</code>\n\n"
-            f"MEMO / NOTE:\n<code>{inv['id']}</code>\n\n"
-            "If your wallet can't add memo, after paying use:\n"
-            f"/confirm {inv['id']} <tx_signature>",
-            parse_mode="HTML",
-            disable_web_page_preview=True
+            "Pay to (Solana):\n"
+            f"<pre>{html.escape(PAY_WALLET)}</pre>\n"
+            "Reference:\n"
+            f"<pre>{html.escape(inv['id'])}</pre>\n"
+            "(Include this reference in the transfer note/memo)\n\n"
+            "After payment tap: ✅ <b>I Paid</b>"
         )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")],
+            [InlineKeyboardButton("📋 Wallet", callback_data=f"copy|wallet|{inv['id']}"), InlineKeyboardButton("📋 Reference", callback_data=f"copy|ref|{inv['id']}")],
+        ])
+        await update.effective_message.reply_text(summary_html, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
 
     await update.effective_message.reply_text(
@@ -2004,7 +2060,9 @@ async def broadcast_buy(app: Application, mint: str, buy: Dict[str, Any]) -> Non
     # mirror into trending channel
     if MIRROR_TO_TRENDING and TRENDING_POST_CHAT_ID:
         try:
-            await _send_buy_to_chat(app, int(TRENDING_POST_CHAT_ID), mint, buy, is_channel=True)
+            cid = await get_trending_chat_id(app)
+            if cid:
+                await _send_buy_to_chat(app, cid, mint, buy, is_channel=True)
         except Exception:
             pass
 
