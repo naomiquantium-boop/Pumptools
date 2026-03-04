@@ -2,6 +2,7 @@
 import os, json, time, asyncio, logging, re, html, math, secrets
 from typing import Any, Dict, Optional, List, Tuple
 import requests
+from solders.pubkey import Pubkey
 
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 def parse_first_base58(text: str) -> str | None:
@@ -122,6 +123,20 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 # Solana / Helius
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 HELIUS_BASE = os.getenv("HELIUS_BASE", "https://api-mainnet.helius-rpc.com").strip().rstrip("/")
+
+# Pump.fun program id (used to derive bonding curve PDA from mint)
+PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+def derive_pump_bonding_curve(mint: str) -> str | None:
+    """Derive pump.fun bonding curve PDA from the token mint (no RPC needed)."""
+    try:
+        program = Pubkey.from_string(PUMP_FUN_PROGRAM_ID)
+        mint_pk = Pubkey.from_string(mint)
+        bc, _bump = Pubkey.find_program_address([b"bonding-curve", bytes(mint_pk)], program)
+        return str(bc)
+    except Exception:
+        return None
+
 POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 
@@ -2053,7 +2068,16 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     }
     save_tokens()
     # Try to auto-resolve a good watch address for buy detection.
-    # We prefer the DexScreener pairAddress (pool) because the token mint itself often won't have swap signatures.
+    # Priority:
+    #  1) Pump.fun bonding curve PDA (best for pre-graduation pump.fun tokens)
+    #  2) DexScreener pairAddress (pool) for graduated / DEX pools
+    watch_addr = ""
+    watch_kind = ""
+    bc = derive_pump_bonding_curve(mint)
+    if bc:
+        watch_addr = bc
+        watch_kind = "pump_bonding_curve"
+
     pair_addr = ""
     try:
         pairs = dexscreener_token_pairs(mint) or []
@@ -2065,13 +2089,19 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         pair_addr = ""
 
-    if pair_addr:
-        TOKENS[mint]["watch_address"] = pair_addr
+    if (not watch_addr) and pair_addr:
+        watch_addr = pair_addr
+        watch_kind = "dexscreener_pair"
+
+    if watch_addr:
+        TOKENS[mint]["watch_address"] = watch_addr
+        if watch_kind:
+            TOKENS[mint]["watch_kind"] = watch_kind
         save_tokens()
 
-    if pair_addr:
+    if watch_addr:
         await update.effective_message.reply_text(
-            f"✅ Added {symbol}.\n✅ Auto watch set: {pair_addr}\nBuys should start posting soon.",
+            f"✅ Added {symbol}.\n✅ Auto watch set: {watch_addr} ({watch_kind or 'auto'})\nBuys should start posting soon.",
             disable_web_page_preview=True,
         )
     else:
