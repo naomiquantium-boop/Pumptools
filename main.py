@@ -1596,13 +1596,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # --- Interactive booking flow state machine ---
-    
-# --- Interactive booking flow state machine ---
-if context.user_data.get("awaiting_booking_mint") and text_in:
-    mint = parse_first_base58(text_in) or text_in.strip().split()[0].strip()
-    flow = context.user_data.get("booking_flow") or {}
-    # Auto-create token entry if missing (token CA == mint on Solana)
-    ensure_token_entry(mint)
+    if context.user_data.get("awaiting_booking_mint") and text_in:
+        mint = parse_first_base58(text_in) or text_in.strip().split()[0].strip()
+        flow = context.user_data.get("booking_flow") or {}
+        # Auto-create token entry if missing (token CA == mint on Solana)
+        ensure_token_entry(mint)
         kind = flow.get("kind")
         dur = flow.get("duration")
         price = float(flow.get("price") or 0)
@@ -1611,7 +1609,10 @@ if context.user_data.get("awaiting_booking_mint") and text_in:
             context.user_data["booking_flow"] = flow
             context.user_data.pop("awaiting_booking_mint", None)
             context.user_data["awaiting_ad_content"] = True
-            await msg.reply_text("Send ad text + link (format: text | https://link). You can also send an image/video with the caption in that format.", disable_web_page_preview=True)
+            await msg.reply_text(
+                "Send ad text + link (format: text | https://link). You can also send an image/video with the caption in that format.",
+                disable_web_page_preview=True,
+            )
             return
         inv = _mk_invoice_ref("trending", mint, dur, price, update.effective_chat.id, update.effective_user.id)
         sym = TOKENS.get(mint, {}).get("symbol") or "TOKEN"
@@ -1630,12 +1631,19 @@ if context.user_data.get("awaiting_booking_mint") and text_in:
             "After payment tap: ✅ <b>I Paid</b>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")],
-            [InlineKeyboardButton("📋 Wallet", callback_data=f"copy|wallet|{inv['id']}"), InlineKeyboardButton("📋 Reference", callback_data=f"copy|ref|{inv['id']}")],
+            [
+                InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}"),
+            ],
+            [
+                InlineKeyboardButton("📋 Wallet", callback_data=f"copy|wallet|{inv['id']}"),
+                InlineKeyboardButton("📋 Reference", callback_data=f"copy|ref|{inv['id']}"),
+            ],
         ])
         context.user_data.pop("awaiting_booking_mint", None)
         await msg.reply_text(summary_html, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
+
 
     if context.user_data.get("awaiting_ad_content"):
         flow = context.user_data.get("booking_flow") or {}
@@ -1670,17 +1678,28 @@ if context.user_data.get("awaiting_booking_mint") and text_in:
         _save_json(INVOICES_FILE, INVOICES)
         context.user_data.pop('awaiting_ad_content', None)
         sym = TOKENS.get(mint, {}).get('symbol') or 'TOKEN'
-        summary = (
-            "✅ Order Summary\n\n"
-            f"Token: ${sym}\n"
-            f"Duration: {dur}\n"
-            f"Price: {price} SOL\n\n"
-            f"Pay to (Solana):\n{PAY_WALLET}\n\n"
-            f"Reference: {inv['id']}\n"
+        summary_html = (
+            "✅ <b>Order Summary</b>\n\n"
+            f"Token: <b>${html.escape(sym)}</b>\n"
+            f"Duration: <b>{html.escape(str(dur))}</b>\n"
+            f"Price: <b>{price} SOL</b>\n\n"
+            "Pay to (Solana):\n"
+            f"<pre>{html.escape(PAY_WALLET)}</pre>\n"
+            "Reference:\n"
+            f"<pre>{html.escape(inv['id'])}</pre>\n"
             "(Include this reference in the transfer note/memo)\n\n"
-            "After payment tap: ✅ I Paid"
+            "After payment tap: ✅ <b>I Paid</b>"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")]])
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}"),
+            ],
+            [
+                InlineKeyboardButton("📋 Wallet", callback_data=f"copy|wallet|{inv['id']}"),
+                InlineKeyboardButton("📋 Reference", callback_data=f"copy|ref|{inv['id']}"),
+            ],
+        ])
         await msg.reply_text(summary_html, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
     txt = msg.text.strip()
@@ -2384,9 +2403,9 @@ def main() -> None:
     application.add_handler(CommandHandler("claim_owner", cmd_claim_owner))
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
-        application.add_handler(CommandHandler("track", cmd_track))
+    application.add_handler(CommandHandler("track", cmd_track))
     application.add_handler(CommandHandler("watchlist", cmd_watchlist))
-application.add_handler(CommandHandler("addtoken", cmd_addtoken))
+    application.add_handler(CommandHandler("addtoken", cmd_addtoken))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
     application.add_handler(CommandHandler("deltoken", cmd_deltoken))
     application.add_handler(CommandHandler("adset", cmd_adset))
