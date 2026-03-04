@@ -3,6 +3,16 @@ import os, json, time, asyncio, logging, re, html, math, secrets
 from typing import Any, Dict, Optional, List, Tuple
 import requests
 
+BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+def parse_first_base58(text: str) -> str | None:
+    if not text:
+        return None
+    for part in text.replace("\n"," ").replace("\t"," ").split():
+        if BASE58_RE.match(part):
+            return part
+    return None
+
+
 
 
 
@@ -1505,7 +1515,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data["booking_flow"] = {"kind":"trending","slot":cat,"duration":dur,"price":float(price)}
         context.user_data["awaiting_booking_mint"] = True
-        await q.message.reply_text("Send token mint address:")
+        await q.message.reply_text("Send token CA (contract address):")
         return
 
     if data.startswith("adsdur|"):
@@ -1517,7 +1527,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data["booking_flow"] = {"kind":"ads","duration":dur,"price":float(price)}
         context.user_data["awaiting_booking_mint"] = True
-        await q.message.reply_text("Send token mint address:")
+        await q.message.reply_text("Send token CA (contract address):")
         return
 
     if data.startswith("paid|"):
@@ -1586,12 +1596,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # --- Interactive booking flow state machine ---
-    if context.user_data.get("awaiting_booking_mint") and text_in:
-        mint = text_in.strip()
-        flow = context.user_data.get("booking_flow") or {}
-        if mint not in TOKENS:
-            await msg.reply_text("Unknown mint. Ask owner to add it first, or send a valid tracked mint.")
-            return
+    
+# --- Interactive booking flow state machine ---
+if context.user_data.get("awaiting_booking_mint") and text_in:
+    mint = parse_first_base58(text_in) or text_in.strip().split()[0].strip()
+    flow = context.user_data.get("booking_flow") or {}
+    # Auto-create token entry if missing (token CA == mint on Solana)
+    ensure_token_entry(mint)
         kind = flow.get("kind")
         dur = flow.get("duration")
         price = float(flow.get("price") or 0)
@@ -1850,11 +1861,46 @@ async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"• {t.get('symbol','TOKEN')} — {t.get('mint')}")
     await update.effective_message.reply_text("\n".join(lines))
 
+
+
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner command: /track <token_ca> - auto-detect best DexScreener pair and set watch address."""
+    if not is_owner(update.effective_user.id):
+        return
+    if len(context.args) < 1:
+        await update.effective_message.reply_text("Usage: /track <token CA>")
+        return
+    mint = parse_first_base58(" ".join(context.args)) or context.args[0].strip()
+    t = ensure_token_entry(mint)
+    md = get_market_data(mint)
+    pair_addr = md.get("pairAddress") or md.get("pair_address")
+    if pair_addr:
+        t["watch_address"] = pair_addr
+        t["pair_address"] = pair_addr
+        save_tokens()
+        await update.effective_message.reply_text(f"✅ Tracking {t.get('symbol','TOKEN')}\nCA: {mint}\nWatch: {pair_addr}")
+    else:
+        await update.effective_message.reply_text(f"⚠️ Added token CA but couldn't find a pair yet. Try again later.\nCA: {mint}")
+
+
+async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    if not TOKENS:
+        await update.effective_message.reply_text("No tokens tracked yet.")
+        return
+    lines = []
+    for mint, t in TOKENS.items():
+        wa = t.get("watch_address") or ""
+        sym = t.get("symbol") or mint[:6]
+        lines.append(f"{sym} | CA: {mint} | watch: {wa if wa else '-'}")
+    await update.effective_message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
 async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
     if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /addtoken <mint> <SYMBOL> <Name...>\nOptional: add watch address later with /setwatch <mint> <address>")
+        await update.effective_message.reply_text("Usage: /addtoken <token CA> <SYMBOL> <Name...>\nOptional: add watch address later with /setwatch <token CA> <address>")
         return
     mint = context.args[0].strip()
     symbol = context.args[1].strip()
@@ -1876,7 +1922,7 @@ async def cmd_setwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_owner(update.effective_user.id):
         return
     if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /setwatch <mint> <pool_or_bonding_curve_address>")
+        await update.effective_message.reply_text("Usage: /setwatch <token CA> <pool_or_bonding_curve_address>")
         return
     mint = context.args[0].strip()
     addr = context.args[1].strip()
@@ -1925,7 +1971,7 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(context.args) < 2:
         await update.effective_message.reply_text("Usage: /force_trending <mint> <duration> (example: 6h)")
         return
-    mint = context.args[0].strip(); dur = context.args[1].strip().lower()
+    mint = parse_first_base58(" ".join(context.args)) or context.args[0].strip(); dur = context.args[1].strip().lower()
     ensure_token_entry(mint)
     seconds = duration_key_to_seconds(dur)
     BOOKINGS.setdefault('trending', {})
@@ -2338,7 +2384,9 @@ def main() -> None:
     application.add_handler(CommandHandler("claim_owner", cmd_claim_owner))
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
-    application.add_handler(CommandHandler("addtoken", cmd_addtoken))
+        application.add_handler(CommandHandler("track", cmd_track))
+    application.add_handler(CommandHandler("watchlist", cmd_watchlist))
+application.add_handler(CommandHandler("addtoken", cmd_addtoken))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
     application.add_handler(CommandHandler("deltoken", cmd_deltoken))
     application.add_handler(CommandHandler("adset", cmd_adset))
