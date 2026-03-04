@@ -202,7 +202,8 @@ LEADERBOARD_MSG_FILE = _data_path(os.getenv("LEADERBOARD_MSG_FILE", "leaderboard
 # Leaderboard
 LEADERBOARD_ON = str(os.getenv("LEADERBOARD_ON", "1")).strip().lower() in ("1","true","yes","on")
 LEADERBOARD_INTERVAL = max(30, int(float(os.getenv("LEADERBOARD_INTERVAL", "60"))))
-LEADERBOARD_ORGANIC_TOPN = max(5, int(os.getenv("LEADERBOARD_ORGANIC_TOPN", "10")))
+# How many total rows to show (Top 3 + 7 = 10 by default)
+LEADERBOARD_TOTAL_ROWS = max(3, int(os.getenv("LEADERBOARD_TOTAL_ROWS", "10")))
 
 # Ads under buy posts
 DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Advertise here").strip()
@@ -937,29 +938,26 @@ def build_leaderboard_html() -> str:
     """Leaderboard (SpyTON style) without code block; token symbols clickable to their Telegram if set."""
     _clean_expired()
 
-    # Rank: booked first, then organic by 6h volume
+    # Rank: booked first (paid trending), then organic tokens by recent activity.
     ranked: List[str] = []
     booked = list((BOOKINGS.get("trending", {}) or {}).keys())
     for mint in booked:
-        if mint in TOKENS:
+        if mint in TOKENS and mint not in ranked:
             ranked.append(mint)
 
-    if TOKENS:
-        vols: List[Tuple[float, str]] = []
-        for mint in TOKENS.keys():
-            if mint in ranked:
-                continue
-            md = get_market_data(mint)
-            v = md.get("volumeH6") or 0
-            try:
-                vols.append((float(v), mint))
-            except Exception:
-                pass
-        vols.sort(reverse=True)
-        for _, mint in vols:
-            ranked.append(mint)
+    # Organic: tokens explicitly marked organic or that have recent buys.
+    organic_candidates: List[Tuple[float, str]] = []
+    for mint, tok in (TOKENS or {}).items():
+        if mint in ranked:
+            continue
+        if tok.get("organic") or tok.get("last_buy_ts"):
+            ts = float(tok.get("last_buy_ts") or 0.0)
+            organic_candidates.append((ts, mint))
+    organic_candidates.sort(reverse=True)
+    for _, mint in organic_candidates:
+        ranked.append(mint)
 
-    ranked = ranked[:10]
+    ranked = ranked[:LEADERBOARD_TOTAL_ROWS]
 
     def sym_link(mint: str) -> str:
         sym = (TOKENS.get(mint, {}) or {}).get("symbol") or mint[:4]
@@ -1133,6 +1131,17 @@ def save_ads() -> None:
 
 def save_groups() -> None:
     _save_json(GROUPS_FILE, GROUPS)
+
+# -------------------- ORGANIC LEADERBOARD HELPERS --------------------
+def mark_organic(mint: str) -> None:
+    """Mark a token as organic and update its last activity timestamp."""
+    tok = TOKENS.get(mint)
+    if not tok:
+        return
+    tok["organic"] = True
+    tok["last_buy_ts"] = time.time()
+    TOKENS[mint] = tok
+    save_tokens()
 
 # -------------------- TELEGRAM COMMANDS --------------------
 def build_deeplink(param: str) -> str:
@@ -1929,6 +1938,98 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines.append(f"{sym} | CA: {mint} | watch: {wa if wa else '-'}")
     await update.effective_message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner diagnostic: shows loop status, watched tokens, and channel config."""
+    if not is_owner(update.effective_user.id):
+        return
+    watched = sum(1 for t in (TOKENS or {}).values() if (t.get("watch_address") or "").strip())
+    total = len(TOKENS or {})
+    last_poll = context.application.bot_data.get("last_buy_poll_ts")
+    age = "-"
+    if isinstance(last_poll, (int, float)) and last_poll > 0:
+        age = f"{int(time.time()-float(last_poll))}s ago"
+    chat_id = (TRENDING_POST_CHAT_ID or "-")
+    await update.effective_message.reply_text(
+        "\n".join([
+            f"✅ Running",
+            f"Tokens: {total} (watched: {watched})",
+            f"Last buy poll: {age}",
+            f"Mirror to trending: {MIRROR_TO_TRENDING}",
+            f"TRENDING_POST_CHAT_ID: {chat_id}",
+        ]),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_debug_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner diagnostic: fetch last txs for a token watch address and show if they parse as buys."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /debug_watch <token CA>")
+        return
+    mint = parse_first_base58(" ".join(context.args)) or context.args[0].strip()
+    tok = TOKENS.get(mint)
+    if not tok:
+        await update.effective_message.reply_text("Unknown token. Use /track <CA> first.")
+        return
+    watch = (tok.get("watch_address") or "").strip()
+    if not watch:
+        await update.effective_message.reply_text("Token has no watch address. Use /track <CA>.")
+        return
+    try:
+        txs = helius_get_transactions_by_address(watch, limit=5) or []
+    except Exception as e:
+        await update.effective_message.reply_text(f"Helius error: {e}")
+        return
+    lines = [f"Debug {tok.get('symbol','TOKEN')} watch: {watch}"]
+    for tx in txs[:3]:
+        sig = (tx.get("signature") or "")[:12]
+        buy = parse_buy_from_tx(tx, mint)
+        ok = "BUY✅" if buy else "-"
+        lines.append(f"{sig}... {ok}")
+    await update.effective_message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_seed_organic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner: seed organic leaderboard with one or more token CAs.
+    Usage: /seed_organic <CA1> <CA2> ..."""
+    if not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /seed_organic <token CA> [more CAs]")
+        return
+    added = 0
+    for part in context.args:
+        mint = parse_first_base58(part) or (part.strip() if BASE58_RE.match(part.strip()) else None)
+        if not mint:
+            continue
+        t = ensure_token_entry(mint)
+        t["organic"] = True
+        if not t.get("last_buy_ts"):
+            t["last_buy_ts"] = time.time()
+        TOKENS[mint] = t
+        added += 1
+    save_tokens()
+    # Kick leaderboard refresh
+    if LEADERBOARD_ON and TRENDING_POST_CHAT_ID:
+        try:
+            ref = await ensure_leaderboard_message(context.application)
+            if ref:
+                chat_id, mid = ref
+                await context.application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=build_leaderboard_html(),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]])
+                )
+        except Exception:
+            pass
+    await update.effective_message.reply_text(f"✅ Seeded {added} organic token(s).")
+
 async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -2283,6 +2384,7 @@ async def buy_poller(app: Application) -> None:
 
     while True:
         try:
+            app.bot_data["last_buy_poll_ts"] = time.time()
             _clean_expired()
             for mint, tok in list(TOKENS.items()):
                 watch = (tok.get("watch_address") or "").strip()
@@ -2370,6 +2472,12 @@ async def _send_buy_to_chat(app: Application, chat_id: int, mint: str, buy: Dict
     await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
 
 async def broadcast_buy(app: Application, mint: str, buy: Dict[str, Any]) -> None:
+    # Any token that produces a buy becomes organic by default
+    try:
+        if mint in TOKENS:
+            mark_organic(mint)
+    except Exception:
+        pass
     # send to all enabled groups
     for chat_id, cfg in (GROUPS or {}).items():
         try:
@@ -2436,6 +2544,9 @@ def main() -> None:
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("track", cmd_track))
     application.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("debug_watch", cmd_debug_watch))
+    application.add_handler(CommandHandler("seed_organic", cmd_seed_organic))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
     application.add_handler(CommandHandler("deltoken", cmd_deltoken))
