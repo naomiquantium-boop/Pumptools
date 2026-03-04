@@ -104,6 +104,7 @@ MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() i
 OWNER_IDS = [int(x) for x in re.split(r"[ ,;]+", os.getenv("OWNER_IDS", "").strip()) if x.strip().isdigit()]
 PAY_WALLET = os.getenv("PAY_WALLET", "").strip()  # Solana address to receive SOL
 # Owner fallback (if OWNER_IDS env not set): allow claiming owner once and persist to file
+DATA_DIR = os.getenv("DATA_DIR", ".")
 OWNER_IDS_FILE = os.path.join(DATA_DIR or ".", "owner_ids.json")
 
 def _load_owner_ids() -> List[int]:
