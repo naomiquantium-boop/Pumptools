@@ -83,7 +83,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 # Solana / Helius
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
-HELIUS_BASE = os.getenv("HELIUS_BASE", "https://api-mainnet.helius-rpc.com").strip().rstrip("/")
+# Helius Enhanced API base (NOT the RPC base). The enhanced endpoint we use is:
+#   GET https://api.helius.xyz/v0/addresses/<address>/transactions?api-key=...
+# Many people mistakenly use the RPC hostname (api-mainnet.helius-rpc.com),
+# which will NEVER work with /v0/addresses endpoints.
+HELIUS_BASE = os.getenv("HELIUS_BASE", "https://api.helius.xyz").strip().rstrip("/")
 POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 
