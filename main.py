@@ -1398,27 +1398,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # ----- Settings callbacks -----
-    # Socials submenu callbacks
-    if data.startswith("soc|"):
-        parts = data.split("|")
-        if len(parts) < 3:
-            return
-        mint = parts[1]
-        kind = parts[2]
-        gid = context.user_data.get("setup_group_id")
-        if kind == "tg":
-            context.user_data["awaiting_setting"] = {"kind": "social_tg", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send Telegram link (example: https://t.me/yourchat)", disable_web_page_preview=True)
-            return
-        if kind == "x":
-            context.user_data["awaiting_setting"] = {"kind": "social_x", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send Twitter/X link (example: https://x.com/name)", disable_web_page_preview=True)
-            return
-        if kind == "web":
-            context.user_data["awaiting_setting"] = {"kind": "social_web", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send Website link (example: https://site.com)", disable_web_page_preview=True)
-            return
-        return
     if data.startswith("cfg|"):
         parts = data.split("|")
         if len(parts) >= 2 and parts[1] == "back":
@@ -1480,14 +1459,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         if action == "socials":
-            # Show socials submenu like Major (Telegram / X / Website)
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Telegram", callback_data=f"soc|{mint}|tg"),
-                 InlineKeyboardButton("✅ Website", callback_data=f"soc|{mint}|web")],
-                [InlineKeyboardButton("✅ Twitter / X", callback_data=f"soc|{mint}|x")],
-                [InlineKeyboardButton("⬅ Back", callback_data=f"cfg|{mint}|back")]
+                [InlineKeyboardButton('✅ Telegram', callback_data=f'cfg|{mint}|social_tg'), InlineKeyboardButton('✅ X / Twitter', callback_data=f'cfg|{mint}|social_x')],
+                [InlineKeyboardButton('⬅️ Back', callback_data=f'cfg|{mint}|back_settings')]
             ])
-            await q.message.reply_text("➡️ Add or update social links:", reply_markup=kb, disable_web_page_preview=True)
+            await q.message.reply_text('➡️ Add or update social links:', reply_markup=kb, disable_web_page_preview=True)
+            return
+
+        if action == 'back_settings':
+            await q.message.reply_text('Settings:', reply_markup=_settings_keyboard(mint))
+            return
+
+        if action == 'social_tg':
+            context.user_data['awaiting_setting'] = {'kind':'social_tg','mint':mint,'group_id':gid}
+            await q.message.reply_text('➡️ Send Telegram link (https://t.me/...)', disable_web_page_preview=True)
+            return
+
+        if action == 'social_x':
+            context.user_data['awaiting_setting'] = {'kind':'social_x','mint':mint,'group_id':gid}
+            await q.message.reply_text('➡️ Send X/Twitter link (https://x.com/...)', disable_web_page_preview=True)
             return
 
         if action == "delete":
@@ -1627,17 +1617,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mint = parse_first_base58(text_in) or text_in.strip().split()[0].strip()
         flow = context.user_data.get("booking_flow") or {}
         # Auto-create token entry if missing (token CA == mint on Solana)
-        t = ensure_token_entry(mint)
-    # auto-set watch address if missing so buys can post
-    if not (t.get("watch_address") or t.get("pair") or t.get("pair_address")):
-        md = get_market_data(mint)
-        pair_addr = md.get("pairAddress") or md.get("pair_address")
-        if pair_addr:
-            t["watch_address"] = pair_addr
-            t["pair"] = pair_addr
-            t["pair_address"] = pair_addr
-            save_tokens()
-
+        ensure_token_entry(mint)
         kind = flow.get("kind")
         dur = flow.get("duration")
         price = float(flow.get("price") or 0)
@@ -1796,51 +1776,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("Send a photo/video/GIF for media (or type 'remove' to clear).")
             return
 
-        if kind == "socials":
-            # Accept: tg=<url> website=<url> x=<url> (spaces around '=' allowed)
+        if kind in ('social_tg','social_x'):
             t = TOKENS.get(mint) or {}
-            pairs = re.findall(r"(tg|telegram|x|twitter|web|website)\s*=\s*(\S+)", txt, flags=re.IGNORECASE)
-            for k, v in pairs:
-                k = k.lower()
-                v = v.strip()
-                if k in ("tg", "telegram"):
-                    t["telegram"] = v
-                elif k in ("x", "twitter"):
-                    t["twitter"] = v
-                elif k in ("web", "website"):
-                    t["website"] = v
+            url = txt.strip()
+            if not (url.startswith('http://') or url.startswith('https://')):
+                await msg.reply_text('Send a valid link starting with https://', disable_web_page_preview=True)
+                return
+            if kind == 'social_tg':
+                t['telegram'] = url
+                msg_txt = '✅ Telegram link has been updated.'
+            else:
+                t['twitter'] = url
+                msg_txt = '✅ X/Twitter link has been updated.'
             TOKENS[mint] = t
             save_tokens()
-            context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
+            context.user_data.pop('awaiting_setting', None)
+            await msg.reply_text(msg_txt, reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
             return
 
-        if kind == "social_tg":
-            t = TOKENS.get(mint) or {}
-            t["telegram"] = txt.strip()
-            TOKENS[mint] = t
-            save_tokens()
-            context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Telegram link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
-            return
-
-        if kind == "social_x":
-            t = TOKENS.get(mint) or {}
-            t["twitter"] = txt.strip()
-            TOKENS[mint] = t
-            save_tokens()
-            context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Twitter/X link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
-            return
-
-        if kind == "social_web":
-            t = TOKENS.get(mint) or {}
-            t["website"] = txt.strip()
-            TOKENS[mint] = t
-            save_tokens()
-            context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Website link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
-            return
         if kind == "supply":
             try:
                 val = float(txt.replace(",", "").strip())
@@ -2042,6 +1995,11 @@ def ensure_token_entry(mint: str) -> Dict[str, Any]:
     sym = md.get("symbol") or md.get("baseSymbol") or md.get("baseTokenSymbol") or "TOKEN"
     name = md.get("name") or md.get("baseName") or md.get("baseTokenName") or sym
     t = {"mint": mint, "symbol": sym, "name": name, "telegram": DEFAULT_TOKEN_TG}
+    # Try to auto-set watch address (pair/pool) so buys can be detected
+    pair_addr = md.get('pairAddress') or md.get('pair_address')
+    if pair_addr:
+        t['watch_address'] = pair_addr
+        t['pair_address'] = pair_addr
     TOKENS[mint] = t
     save_tokens()
     return t
@@ -2051,8 +2009,20 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(context.args) < 2:
         await update.effective_message.reply_text("Usage: /force_trending <mint> <duration> (example: 6h)")
         return
-    mint = parse_first_base58(" ".join(context.args)) or context.args[0].strip(); dur = context.args[1].strip().lower()
-    ensure_token_entry(mint)
+    # Accept token CA (mint) even if user pasted extra text; duration is second arg.
+    mint = parse_first_base58(" ".join(context.args)) or context.args[0].strip()
+    dur = context.args[1].strip().lower()
+    t = ensure_token_entry(mint)
+
+    # Ensure we have a watch address so buys can be detected.
+    if not (t or {}).get('watch_address'):
+        md = get_market_data(mint)
+        pair_addr = md.get('pairAddress') or md.get('pair_address')
+        if pair_addr:
+            t['watch_address'] = pair_addr
+            t['pair_address'] = pair_addr
+            TOKENS[mint] = t
+            save_tokens()
     seconds = duration_key_to_seconds(dur)
     BOOKINGS.setdefault('trending', {})
     BOOKINGS['trending'][mint] = {'mint': mint, 'started_at': _now(), 'expires_at': _now()+seconds, 'paid_by': 'owner', 'tx': 'owner', 'duration_key': dur, 'price_sol': 0}
