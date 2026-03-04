@@ -103,6 +103,28 @@ MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() i
 # Owner + payments
 OWNER_IDS = [int(x) for x in re.split(r"[ ,;]+", os.getenv("OWNER_IDS", "").strip()) if x.strip().isdigit()]
 PAY_WALLET = os.getenv("PAY_WALLET", "").strip()  # Solana address to receive SOL
+# Owner fallback (if OWNER_IDS env not set): allow claiming owner once and persist to file
+OWNER_IDS_FILE = os.path.join(DATA_DIR or ".", "owner_ids.json")
+
+def _load_owner_ids() -> List[int]:
+    try:
+        with open(OWNER_IDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ids = data.get("owner_ids") or []
+        return [int(x) for x in ids if str(x).isdigit()]
+    except Exception:
+        return []
+
+def _save_owner_ids(ids: List[int]) -> None:
+    try:
+        with open(OWNER_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"owner_ids": ids}, f)
+    except Exception:
+        pass
+
+if not OWNER_IDS:
+    OWNER_IDS = _load_owner_ids()
+
 
 # Pricing (SOL)
 TRENDING_PRICES = os.getenv("TRENDING_PRICES", "1h=0.2,6h=0.8,24h=2.5").strip()
@@ -172,7 +194,7 @@ def is_owner(user_id: int) -> bool:
 # -------------------- PRICING PARSE --------------------
 def _parse_price_map(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
-    for part in re.split(r"[;|]+", s):
+    for part in re.split(r"[;|,]+", s):
         part = part.strip()
         if not part:
             continue
@@ -963,6 +985,20 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's Telegram ID (useful for OWNER_IDS)."""
     u = update.effective_user
     await update.effective_message.reply_text(f"Your Telegram ID: {u.id}")
+
+
+async def cmd_claim_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Claim ownership if OWNER_IDS is empty (one-time)."""
+    u = update.effective_user
+    if not u:
+        return
+    if OWNER_IDS:
+        await update.effective_message.reply_text("Owner already configured.")
+        return
+    OWNER_IDS.append(u.id)
+    _save_owner_ids(OWNER_IDS)
+    await update.effective_message.reply_text(f"✅ Owner claimed: {u.id}\nNow only this ID can use owner commands.")
+
 async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
@@ -1150,7 +1186,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if action == "socials":
             context.user_data["awaiting_setting"] = {"kind": "socials", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name")
+            await q.message.reply_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name", disable_web_page_preview=True)
             return
 
         if action == "delete":
@@ -1198,6 +1234,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data.startswith("trdur|"):
         _, cat, dur = data.split("|", 2)
+        dur = dur.lower()
         price = (TOP3_PRICE_MAP if cat=="top3" else TOP10_PRICE_MAP).get(dur)
         if price is None:
             await q.message.reply_text("Invalid package.")
@@ -1209,6 +1246,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data.startswith("adsdur|"):
         _, dur = data.split("|", 1)
+        dur = dur.lower()
         price = ADS_PACKAGE_MAP.get(dur)
         if price is None:
             await q.message.reply_text("Invalid package.")
@@ -1298,7 +1336,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["booking_flow"] = flow
             context.user_data.pop("awaiting_booking_mint", None)
             context.user_data["awaiting_ad_content"] = True
-            await msg.reply_text("Send ad text + link (format: text | https://link). You can also send an image/video with the caption in that format.")
+            await msg.reply_text("Send ad text + link (format: text | https://link). You can also send an image/video with the caption in that format.", disable_web_page_preview=True)
             return
         inv = _mk_invoice_ref("trending", mint, dur, price, update.effective_chat.id, update.effective_user.id)
         sym = TOKENS.get(mint, {}).get("symbol") or "TOKEN"
@@ -1332,7 +1370,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             ad_text, ad_link = content, ''
         if not ad_link.startswith('http'):
-            await msg.reply_text("Please include a valid link. Format: your text | https://link")
+            await msg.reply_text("Please include a valid link. Format: your text | https://link", disable_web_page_preview=True)
             return
         media_type = None
         file_id = None
@@ -1633,7 +1671,7 @@ async def cmd_force_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("Unknown mint.")
         return
     if '|' not in rest:
-        await update.effective_message.reply_text("Format: text | https://link")
+        await update.effective_message.reply_text("Format: text | https://link", disable_web_page_preview=True)
         return
     ad_text, ad_link = [x.strip() for x in rest.split('|',1)]
     if not ad_link.startswith('http'):
@@ -1740,7 +1778,7 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.effective_message.reply_text(
-        "<pre>📈 PumpTools Trending - Book a Slot\\n\\nSelect category:</pre>",
+        "<pre>📈 PumpTools Trending - Book a Slot\n\nSelect category:</pre>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬇️ Top 3 ⬇️", callback_data="trcat|top3"),
@@ -1781,7 +1819,7 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.effective_message.reply_text(
-        "<pre>📣 PumpTools Ads (shown under buy alerts)\\n\\nChoose duration:</pre>",
+        "<pre>📣 PumpTools Ads (shown under buy alerts)\n\nChoose duration:</pre>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("6H | 1 SOL", callback_data="adsdur|6h"),
@@ -2012,6 +2050,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("myid", cmd_myid))
+    application.add_handler(CommandHandler("claim_owner", cmd_claim_owner))
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
@@ -2023,6 +2062,11 @@ def main() -> None:
     application.add_handler(CommandHandler("trending", cmd_trending))
     application.add_handler(CommandHandler("ads", cmd_ads))
     application.add_handler(CommandHandler("confirm", cmd_confirm))
+
+    application.add_handler(CommandHandler("leaderboard_init", cmd_leaderboard_init))
+    application.add_handler(CommandHandler("leaderboard_reset", cmd_leaderboard_reset))
+    application.add_handler(CommandHandler("force_trending", cmd_force_trending))
+    application.add_handler(CommandHandler("force_ads", cmd_force_ads))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION) & ~filters.COMMAND, on_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
