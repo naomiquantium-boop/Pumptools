@@ -106,7 +106,7 @@ PAY_WALLET = os.getenv("PAY_WALLET", "").strip()  # Solana address to receive SO
 
 # Pricing (SOL)
 TRENDING_PRICES = os.getenv("TRENDING_PRICES", "1h=0.2,6h=0.8,24h=2.5").strip()
-ADS_PRICES = os.getenv("ADS_PRICES", "1d=0.5,3d=1.2,7d=2.5").strip()
+ADS_PRICES = os.getenv("ADS_PRICES", "6h=1,12h=1.5,24h=3").strip()
 
 
 # Package pricing for interactive /trending & /ads flows (defaults match your screenshots)
@@ -786,6 +786,24 @@ async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int
         log.warning("Failed to create leaderboard message: %s", e)
         return None
 
+
+async def maybe_init_leaderboard(app):
+    """Create leaderboard message once (if TRENDING_POST_CHAT_ID is set) and store message_id."""
+    try:
+        chat_id = TRENDING_POST_CHAT_ID
+        if not chat_id:
+            return
+        # If already saved, skip
+        lb = _load_json(LEADERBOARD_MSG_FILE, default={})
+        if lb.get("chat_id") == str(chat_id) and lb.get("message_id"):
+            return
+        # Create a placeholder leaderboard message
+        text = render_leaderboard()
+        msg = await app.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+        _save_json(LEADERBOARD_MSG_FILE, {"chat_id": str(chat_id), "message_id": msg.message_id})
+    except Exception as e:
+        log.warning("Leaderboard init failed: %s", e)
+
 async def leaderboard_loop(app: Application) -> None:
     if not LEADERBOARD_ON:
         return
@@ -939,6 +957,12 @@ Pricing:
     ])
     await update.effective_message.reply_text(start_text(), reply_markup=kb, disable_web_page_preview=True)
 
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's Telegram ID (useful for OWNER_IDS)."""
+    u = update.effective_user
+    await update.effective_message.reply_text(f"Your Telegram ID: {u.id}")
 async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
@@ -1169,7 +1193,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 [InlineKeyboardButton("24 hours | 2.19 SOL", callback_data="trdur|top10|24h")],
             ]
         rows.append([InlineKeyboardButton("⬅ Back", callback_data="trmain"), InlineKeyboardButton("🏠 Main Menu", callback_data="mainmenu")])
-        await q.message.edit_text("<pre>Top packages (prices already -30%)\n\nButtons:</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.edit_text("<pre>Top packages (prices already -30%)
+
+Buttons:</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("trdur|"):
@@ -1987,6 +2013,7 @@ def main() -> None:
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("myid", cmd_myid))
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
