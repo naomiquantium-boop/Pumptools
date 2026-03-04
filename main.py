@@ -84,7 +84,6 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 # Solana / Helius
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
 HELIUS_BASE = os.getenv("HELIUS_BASE", "https://api-mainnet.helius-rpc.com").strip().rstrip("/")
-HELIUS_ENHANCED_BASE = os.getenv("HELIUS_ENHANCED_BASE", "https://api.helius.xyz").strip().rstrip("/")
 POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 
@@ -97,7 +96,6 @@ BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 ADS_LINK_OVERRIDE = os.getenv("ADS_LINK", "").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/PumpToolsListing").strip()
 LEADERBOARD_HEADER_HANDLE = os.getenv("LEADERBOARD_HEADER_HANDLE", "@PumpToolsTrending").strip()
-LEADERBOARD_MESSAGE_ID = os.getenv("LEADERBOARD_MESSAGE_ID", "").strip()
 
 TRENDING_POST_CHAT_ID = os.getenv("TRENDING_POST_CHAT_ID", "").strip()  # numeric id e.g. -100...
 MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() in ("1","true","yes","on")
@@ -244,7 +242,7 @@ _ad_rotation_idx = 0
 # -------------------- SOLANA / HELIUS --------------------
 def helius_get_transactions_by_address(address: str, limit: int = 20) -> List[Dict[str, Any]]:
     # Docs: GET /v0/addresses/{address}/transactions?api-key=...
-    url = f"{HELIUS_ENHANCED_BASE}/v0/addresses/{address}/transactions"
+    url = f"{HELIUS_BASE}/v0/addresses/{address}/transactions"
     params = {"api-key": HELIUS_API_KEY, "limit": str(limit)}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
@@ -484,44 +482,8 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
     # We treat as "buy" when swap.nativeInput > 0 and tokenOutputs include token_mint.
     ev = (tx.get("events") or {}).get("swap") or {}
     token_outputs = ev.get("tokenOutputs") or []
-    token_inputs = ev.get("tokenInputs") or []
-    native_in_obj = (ev.get("nativeInput") or {})
-    native_in = native_in_obj.get("amount")
+    native_in = (ev.get("nativeInput") or {}).get("amount")
     sol_in = _amount_to_sol(native_in) if native_in is not None else 0.0
-    spent_symbol = "SOL"
-    spent_amount = sol_in
-    spent_usd = None
-    try:
-        spent_usd = float(native_in_obj.get("usdValue")) if native_in_obj.get("usdValue") is not None else None
-    except Exception:
-        spent_usd = None
-    # If no native SOL input, detect token input (WSOL/USDC etc)
-    if spent_amount <= 0 and token_inputs:
-        ti = token_inputs[0]
-        mint_in = (ti.get("mint") or "").strip()
-        sym_in = (ti.get("symbol") or "").strip() or "TOKEN"
-        raw = (ti.get("rawTokenAmount") or {})
-        amt_in = None
-        try:
-            amt_in = float(raw.get("tokenAmount"))
-        except Exception:
-            try:
-                amt_in = float(ti.get("tokenAmount"))
-            except Exception:
-                amt_in = None
-        if amt_in is not None:
-            spent_amount = amt_in
-            # normalize names
-            if mint_in.startswith("So111") or sym_in.upper() in ("WSOL","SOL"):
-                spent_symbol = "WSOL"
-            elif sym_in.upper() == "USDC":
-                spent_symbol = "USDC"
-            else:
-                spent_symbol = sym_in.upper()[:8]
-        try:
-            spent_usd = float(ti.get("usdValue")) if ti.get("usdValue") is not None else spent_usd
-        except Exception:
-            pass
 
     out_amt = None
     out_dec = None
@@ -554,17 +516,18 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
                     out_amt = None
                 out_user = tt.get("toUserAccount") or tt.get("userAccount")
                 break
+    if out_amt is None:
+        return None
 
-    if sol_in <= 0 or out_amt is None:
+    # accept buys paid with SOL / WSOL / USDC etc.
+    if spent_amount is None or spent_amount <= 0:
         return None
 
     return {
         "signature": tx.get("signature"),
         "timestamp": tx.get("timestamp") or int(time.time()),
         "buyer": out_user or tx.get("feePayer") or "",
-        "spent_amount": spent_amount,
-        "spent_symbol": spent_symbol,
-        "spent_usd": spent_usd,
+        "sol_in": sol_in,
         "token_out": out_amt,
         "token_decimals": out_dec,
         "source": tx.get("source") or "",
@@ -665,48 +628,43 @@ def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Opt
     chart = token.get("chart") or md.get("url") or f"https://dexscreener.com/solana/{mint}"
 
     buyer = buy.get("buyer") or ""
-    spent_amt = float(buy.get("spent_amount") or 0.0)
-    spent_sym = (buy.get("spent_symbol") or "SOL").upper()
-    spent_usd = buy.get("spent_usd")
+    sol_in = float(buy.get("sol_in") or 0.0)
     tok_out = fmt_token_amt(float(buy.get("token_out") or 0.0), buy.get("token_decimals") or token.get("decimals"))
 
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
     liq = md.get("liquidityUsd")
+    holders = buy.get("holders")  # optional (not always available)
+    if not holders:
+        holders = solscan_get_holders(mint)
 
     price_line = f"Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "Price: -"
     liq_line = f"Liquidity: ${fmt_num(float(liq),0)}" if liq else "Liquidity: -"
     mcap_line = f"MCap: ${fmt_num(float(fdv),0)}" if fdv else "MCap: -"
+    holders_line = f"Holders: {fmt_num(float(holders),0)}" if holders else "Holders: -"
 
     ad_text, ad_link = pick_ad_for_post(mint)
     if not ad_link:
         ad_link = _ads_deeplink(mint, app)
 
-    # diamond bar: only meaningful for SOL/WSOL
-    sol_equiv = spent_amt if spent_sym in ("SOL","WSOL") else 0.1
-    bar = diamonds(sol_equiv)
-
-    spent_str = f"{spent_amt:.4f} {spent_sym}"
-    if isinstance(spent_usd, (int,float)) and spent_usd is not None:
-        spent_str += f" (${float(spent_usd):.2f})"
-
-    tg_safe = html.escape(tg)
-    sym_link = f'<a href="{tg_safe}">{html.escape(sym)}</a>' if tg_safe else html.escape(sym)
-
+    # Group style (like your screenshot "3) Group buy style")
     return (
-        f"<b>{sym_link} Buy!</b>\n"
-        f"{bar}\n\n"
-        f"Spent: <b>{html.escape(spent_str)}</b>\n"
-        f"Got: <b>{html.escape(tok_out)} {html.escape(sym)}</b>\n\n"
-        f"<a href=\"{html.escape(solscan_addr(buyer))}\">{html.escape(_short(buyer))}</a> | "
-        f"<a href=\"{html.escape(solscan_tx(buy.get('signature') or ''))}\">Txn</a>\n\n"
-        f"{html.escape(price_line)}\n"
-        f"{html.escape(liq_line)}\n"
-        f"{html.escape(mcap_line)}\n\n"
-        f"<a href=\"{html.escape(chart)}\">TX</a> | "
-        f"<a href=\"{tg_safe}\">Telegram</a> | "
-        f"<a href=\"{html.escape(TRENDING_URL)}\">Trending</a>\n"
-        f"ad: <a href=\"{html.escape(ad_link)}\">{html.escape(ad_text or 'Advertise here')}</a>"
+        f"<b>{html.escape(sym)} Buy!</b>\n"
+        f"{diamonds(sol_in)}\n\n"
+        f"Spent:  <b>{fmt_num(sol_in, 4)} SOL</b>\n"
+        f"Got:    <b>{fmt_num(tok_out, 4)} {html.escape(sym)}</b>\n\n"
+        f"<a href=\"{solscan_addr(buyer)}\">{html.escape(_short(buyer))}</a> | "
+        f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n\n"
+        f"{price_line}\n"
+        f"{liq_line}\n"
+        f"{mcap_line}\n"
+        f"{holders_line}\n\n"
+        f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">TX</a> | "
+        f"<a href=\"{_buy_link(mint)}\">GT</a> | "
+        f"<a href=\"{chart}\">DexS</a> | "
+        f"<a href=\"{tg}\">Telegram</a> | "
+        f"<a href=\"{TRENDING_URL}\">Trending</a>\n\n"
+        f"ad: <a href=\"{ad_link}\">{html.escape(ad_text)}</a>"
     )
 
 def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: Optional[Application]=None) -> str:
@@ -716,45 +674,41 @@ def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: O
     md = get_market_data(mint)
     chart = token.get("chart") or md.get("url") or f"https://dexscreener.com/solana/{mint}"
 
-    spent_amt = float(buy.get("spent_amount") or 0.0)
-    spent_sym = (buy.get("spent_symbol") or "SOL").upper()
-    spent_usd = buy.get("spent_usd")
+    buyer = buy.get("buyer") or ""
+    sol_in = float(buy.get("sol_in") or 0.0)
     tok_out = fmt_token_amt(float(buy.get("token_out") or 0.0), buy.get("token_decimals") or token.get("decimals"))
+    usd_val = buy.get("usd_value")
+    usd_txt = f"${fmt_num(float(usd_val),2)}" if usd_val else "$XXX.XX"
 
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
-    liq = md.get("liquidityUsd")
+    holders = buy.get("holders")
 
-    price_line = f"Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "Price: -"
-    liq_line = f"Liquidity: ${fmt_num(float(liq),0)}" if liq else "Liquidity: -"
-    mcap_line = f"MCap: ${fmt_num(float(fdv),0)}" if fdv else "MCap: -"
+    price_line = f"💵 Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "💵 Price: -"
+    mcap_line = f"💰 MarketCap: ${fmt_num(float(fdv),0)}" if fdv else "💰 MarketCap: -"
+    holders_line = f"↩ {fmt_k(float(holders))} Holders" if holders else "↩ Holders: -"
 
     ad_text, ad_link = pick_ad_for_post(mint)
     if not ad_link:
         ad_link = _ads_deeplink(mint, app)
 
-    checks = "✅" * 18
-    spent_str = f"{spent_amt:.4f} {spent_sym}"
-    if isinstance(spent_usd, (int,float)) and spent_usd is not None:
-        spent_str += f" (${float(spent_usd):.2f})"
-
-    tg_safe = html.escape(tg)
-    sym_link = f'<a href="{tg_safe}">{html.escape(sym)}</a>' if tg_safe else html.escape(sym)
-
+    checks = "✅" * 22
     return (
-        f"<b>{sym_link} Buy!</b>\n\n"
+        f"<b>${html.escape(sym)} Buy!</b>\n\n"
         f"{checks}\n\n"
-        f"💎 <b>{html.escape(spent_str)}</b>\n"
-        f"🪙 <b>{html.escape(tok_out)} {html.escape(sym)}</b>\n\n"
-        f"{html.escape(price_line)}\n"
-        f"{html.escape(liq_line)}\n"
-        f"{html.escape(mcap_line)}\n\n"
-        f"🔗 <a href=\"{html.escape(chart)}\">Chart</a> | "
-        f"<a href=\"{tg_safe}\">Telegram</a> | "
-        f"<a href=\"{html.escape(TRENDING_URL)}\">Trending</a>\n"
-        f"ad: <a href=\"{html.escape(ad_link)}\">{html.escape(ad_text or 'Advertise here')}</a>"
+        f"▽  <b>{fmt_num(sol_in, 4)} SOL</b> ({usd_txt})\n"
+        f"↩  <b>{fmt_num(tok_out, 4)} ${html.escape(sym)}</b>\n"
+        f"{holders_line}\n"
+        f"👤 {html.escape(_short(buyer))}: +0.1% | <a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n"
+        f"{price_line}\n"
+        f"{mcap_line}\n\n"
+        f"💎 <a href=\"{LISTING_URL}\">Listing</a> | "
+        f"🐸 <a href=\"{_buy_link(mint)}\">Buy</a> | "
+        f"📊 <a href=\"{chart}\">Chart</a>\n"
+        f"ad: <a href=\"{ad_link}\">{html.escape(ad_text)}</a>"
     )
 
+# Backward-compat for any old calls
 def build_buy_message(token: Dict[str, Any], buy: Dict[str, Any]) -> str:
     return build_buy_message_group(token, buy, None)
 
@@ -773,53 +727,55 @@ def _format_time_left(expires_at: int) -> str:
 
 def build_leaderboard_text() -> str:
     """
-    PumpTools leaderboard (single message, auto-edited).
-    Top 3 (booked) then Top 10 filled with organic (6h volume).
-    Token symbols are clickable to their Telegram links.
+    Style requested (code-block look):
+    🟢 @PumpToolsTrending
+    1□ - $SYMBOL | +0%
+    ...
+    divider after 3
     """
     _clean_expired()
 
+    # Build a ranked list: first booked trending tokens, then fill with organic by 6h volume.
     ranked: List[str] = []
     booked = list((BOOKINGS.get("trending", {}) or {}).keys())
-    for ca in booked:
-        if ca in TOKENS:
-            ranked.append(ca)
+    for mint in booked:
+        if mint in TOKENS:
+            ranked.append(mint)
 
-    # Fill remaining with organic by 6h volume
-    vols: List[Tuple[float, str]] = []
-    for ca in TOKENS.keys():
-        if ca in ranked:
-            continue
-        md = get_market_data(ca)
-        v = md.get("volumeH6") or 0
-        try:
-            vols.append((float(v), ca))
-        except Exception:
-            pass
-    vols.sort(reverse=True)
-    ranked += [ca for _, ca in vols]
+    if TOKENS:
+        vols: List[Tuple[float, str]] = []
+        for mint in TOKENS.keys():
+            if mint in ranked:
+                continue
+            md = get_market_data(mint)
+            v = md.get("volumeH6") or 0
+            try:
+                vols.append((float(v), mint))
+            except Exception:
+                pass
+        vols.sort(reverse=True)
+        ranked += [mint for _, mint in vols]
 
     ranked = ranked[:10]
+    # Fill placeholders
     while len(ranked) < 10:
         ranked.append("")
 
     handle = LEADERBOARD_HEADER_HANDLE or "@PumpToolsTrending"
-    lines: List[str] = [f"🟢 <b>{html.escape(handle)}</b>"]
+    lines = [f"🟢 {handle}"]
     for i in range(1, 11):
-        ca = ranked[i-1]
-        if ca and ca in TOKENS:
-            sym = TOKENS[ca].get("symbol") or "SYMBOL"
-            tg = TOKENS[ca].get("telegram") or DEFAULT_TOKEN_TG
-            sym_html = f'<a href="{html.escape(tg)}">${html.escape(sym)}</a>' if tg else f'${html.escape(sym)}'
+        mint = ranked[i-1]
+        if mint and mint in TOKENS:
+            sym = TOKENS[mint].get("symbol") or "SYMBOL"
             pct = "+0%"
-            lines.append(f"<b>{i}</b>  — {sym_html}  |  <b>{html.escape(pct)}</b>")
+            lines.append(f"{i}□  - ${sym}  | {pct}")
         else:
-            lines.append(f"<b>{i}</b>  — $SYMBOL  |  <b>+0%</b>")
+            lines.append(f"{i}□  - $SYMBOL  | +0%")
         if i == 3:
-            lines.append("──────────────")
+            lines.append("------------------------------------------------")
 
-    # Add Listing button below via reply_markup in caller; keep message as normal HTML (not code block)
-    return "\n".join(lines)
+    # Use <pre> to keep alignment on Telegram
+    return "<pre>\n" + "\n".join(lines) + "\n</pre>"
 
 async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int]]:
     """Ensure a single leaderboard message exists in the trending channel and return (chat_id, message_id).
@@ -892,7 +848,6 @@ async def leaderboard_loop(app: Application) -> None:
                 text=build_leaderboard_text(),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("PumpTools Listing", url=LISTING_URL)]])
             )
         except Exception as e:
             log.warning("leaderboard_loop error: %s", e)
@@ -1217,20 +1172,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-
-    # ----- Socials submenu -----
-    if data.startswith("social|"):
-        try:
-            _, mint, which = data.split("|", 2)
-        except Exception:
-            return
-        if which not in ("tg","x"):
-            return
-        context.user_data["awaiting_setting"] = {"kind": f"social_{which}", "mint": mint, "group_id": context.user_data.get("setup_group_id")}
-        await q.message.reply_text("Send the link now (must start with https://):", disable_web_page_preview=True)
-        return
-
-    
     # ----- Settings callbacks -----
     if data.startswith("cfg|"):
         parts = data.split("|")
@@ -1247,13 +1188,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if gid and mint:
             _group_token_settings(gid, mint)
 
-        if action == "backsettings":
-            await q.message.reply_text("⚙️ Choose from the following options to customize your Buy Bot:", reply_markup=_settings_keyboard(mint))
-            return
-
         if action == "emoji":
             context.user_data["awaiting_setting"] = {"kind": "emoji", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Please send the new emoji for this token:")
+            await q.message.reply_text("Send the emoji you want to use (example: 🎩)")
             return
 
         if action == "supply":
@@ -1272,34 +1209,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         if action == "media":
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_media"] = not bool(s.get("show_media", True))
+                save_groups()
             context.user_data["awaiting_setting"] = {"kind": "mediafile", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send a photo/video/GIF for buy posts, or type 'remove' to clear it.")
+            await q.message.reply_text("Send a photo/video/GIF for media (or type 'remove' to clear).")
             return
 
         if action == "chart":
-            context.user_data["awaiting_setting"] = {"kind": "chart", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send chart link (https://...)")
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_chart"] = not bool(s.get("show_chart", True))
+                save_groups()
+            await q.message.reply_text("✅ Chart setting updated.", reply_markup=_settings_keyboard(mint))
             return
 
         if action == "notif":
-            g = GROUPS.get(str(gid)) or {}
-            tmap = g.get("tokens") or {}
-            tcfg = tmap.get(mint) or {}
-            tcfg["enabled"] = not bool(tcfg.get("enabled", True))
-            tmap[mint] = tcfg
-            g["tokens"] = tmap
-            GROUPS[str(gid)] = g
-            save_groups()
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_notifications"] = not bool(s.get("show_notifications", True))
+                save_groups()
             await q.message.reply_text("✅ Notifications setting updated.", reply_markup=_settings_keyboard(mint))
             return
 
         if action == "socials":
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Telegram", callback_data=f"social|{mint}|tg"),
-                 InlineKeyboardButton("✅ X", callback_data=f"social|{mint}|x")],
-                [InlineKeyboardButton("⬅️ Back", callback_data=f"cfg|{mint}|backsettings")]
-            ])
-            await q.message.reply_text("➡️ Add or update social links:", reply_markup=kb, disable_web_page_preview=True)
+            context.user_data["awaiting_setting"] = {"kind": "socials", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name", disable_web_page_preview=True)
             return
 
         if action == "delete":
@@ -1308,15 +1244,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 tmap = g.get("tokens") or {}
                 if mint in tmap:
                     tmap.pop(mint, None)
-                    g["tokens"] = tmap
-                    GROUPS[str(gid)] = g
                     save_groups()
             await q.message.reply_text("🗑️ Token removed from this group.")
             return
 
         return
 
-# ----- Booking flows (Trending / Ads) -----
+    # ----- Booking flows (Trending / Ads) -----
     if data == "trmain":
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("⬇️ Top 3 ⬇️", callback_data="trcat|top3"),
@@ -1440,44 +1374,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get("awaiting_booking_mint") and text_in:
         mint = text_in.strip()
         flow = context.user_data.get("booking_flow") or {}
-        
         if mint not in TOKENS:
-            # Auto-track by CA: fetch pairs and pick highest volume/liquidity
-            try:
-                pairs = dexscreener_token_pairs(mint)
-            except Exception:
-                pairs = []
-            if not pairs:
-                await msg.reply_text("Unknown token CA. Please send a valid Solana token CA.")
-                return
-            def score(p):
-                try:
-                    v = float(((p.get("volume") or {}).get("h24")) or 0)
-                except Exception:
-                    v = 0
-                try:
-                    l = float(((p.get("liquidity") or {}).get("usd")) or 0)
-                except Exception:
-                    l = 0
-                return v*2 + l
-            best = max(pairs, key=score)
-            base = best.get("baseToken") or {}
-            sym = base.get("symbol") or "TOKEN"
-            name = base.get("name") or sym
-            pair_addr = best.get("pairAddress") or ""
-            TOKENS[mint] = {
-                **(TOKENS.get(mint) or {}),
-                "mint": mint,
-                "symbol": sym,
-                "name": name,
-                "pair": pair_addr,
-                "chart": best.get("url") or (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"),
-                "watch_address": pair_addr,
-                "kind": "solana",
-                "telegram": DEFAULT_TOKEN_TG,
-                "twitter": "",
-            }
-            save_tokens()
+            await msg.reply_text("Unknown mint. Ask owner to add it first, or send a valid tracked mint.")
+            return
         kind = flow.get("kind")
         dur = flow.get("duration")
         price = float(flow.get("price") or 0)
@@ -1615,20 +1514,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("Send a photo/video/GIF for media (or type 'remove' to clear).")
             return
 
-        if kind in ("social_tg","social_x"):
-            url = txt.strip()
-            if not (url.startswith("http://") or url.startswith("https://")):
-                await msg.reply_text("Please send a valid link starting with https://")
-                return
+        if kind == "socials":
+            # format: tg=<url> website=<url> x=<url>
             t = TOKENS.get(mint) or {}
-            if kind == "social_tg":
-                t["telegram"] = url
-            else:
-                t["twitter"] = url
+            for part in txt.split():
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                k = k.lower().strip()
+                v = v.strip()
+                if k in ("tg", "telegram"):
+                    t["telegram"] = v
+                elif k in ("x", "twitter"):
+                    t["twitter"] = v
+                elif k in ("web", "website"):
+                    t["website"] = v
             TOKENS[mint] = t
             save_tokens()
             context.user_data.pop("awaiting_setting", None)
-            await msg.reply_text("✅ Social link updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
+            await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
             return
 
         if kind == "supply":
@@ -1792,42 +1696,12 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_owner(update.effective_user.id):
         return
     if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /force_trending <token_ca> <duration> (example: 6h)")
+        await update.effective_message.reply_text("Usage: /force_trending <CA> <duration> (example: 6h)")
         return
     mint = context.args[0].strip(); dur = context.args[1].strip().lower()
     if mint not in TOKENS:
-        # auto-add by token CA
-        try:
-            pairs = dexscreener_token_pairs(mint)
-        except Exception:
-            pairs = []
-        if not pairs:
-            await update.effective_message.reply_text("Unknown token CA.")
-            return
-        def score(p):
-            try: v=float(((p.get("volume") or {}).get("h24")) or 0)
-            except Exception: v=0
-            try: l=float(((p.get("liquidity") or {}).get("usd")) or 0)
-            except Exception: l=0
-            return v*2+l
-        best=max(pairs, key=score)
-        base=best.get("baseToken") or {}
-        sym=base.get("symbol") or "TOKEN"
-        name=base.get("name") or sym
-        pair_addr=best.get("pairAddress") or ""
-        TOKENS[mint]={
-            **(TOKENS.get(mint) or {}),
-            "mint": mint,
-            "symbol": sym,
-            "name": name,
-            "pair": pair_addr,
-            "chart": best.get("url") or (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"),
-            "watch_address": pair_addr,
-            "kind": "solana",
-            "telegram": DEFAULT_TOKEN_TG,
-            "twitter": "",
-        }
-        save_tokens()
+        await update.effective_message.reply_text("Unknown mint.")
+        return
     seconds = duration_key_to_seconds(dur)
     BOOKINGS.setdefault('trending', {})
     BOOKINGS['trending'][mint] = {'mint': mint, 'started_at': _now(), 'expires_at': _now()+seconds, 'paid_by': 'owner', 'tx': 'owner', 'duration_key': dur, 'price_sol': 0}
@@ -1848,38 +1722,8 @@ async def cmd_force_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     mint = context.args[0].strip(); dur = context.args[1].strip().lower(); rest = ' '.join(context.args[2:]).strip()
     if mint not in TOKENS:
-        # auto-add by token CA
-        try:
-            pairs = dexscreener_token_pairs(mint)
-        except Exception:
-            pairs = []
-        if not pairs:
-            await update.effective_message.reply_text("Unknown token CA.")
-            return
-        def score(p):
-            try: v=float(((p.get("volume") or {}).get("h24")) or 0)
-            except Exception: v=0
-            try: l=float(((p.get("liquidity") or {}).get("usd")) or 0)
-            except Exception: l=0
-            return v*2+l
-        best=max(pairs, key=score)
-        base=best.get("baseToken") or {}
-        sym=base.get("symbol") or "TOKEN"
-        name=base.get("name") or sym
-        pair_addr=best.get("pairAddress") or ""
-        TOKENS[mint]={
-            **(TOKENS.get(mint) or {}),
-            "mint": mint,
-            "symbol": sym,
-            "name": name,
-            "pair": pair_addr,
-            "chart": best.get("url") or (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"),
-            "watch_address": pair_addr,
-            "kind": "solana",
-            "telegram": DEFAULT_TOKEN_TG,
-            "twitter": "",
-        }
-        save_tokens()
+        await update.effective_message.reply_text("Unknown mint.")
+        return
     if '|' not in rest:
         await update.effective_message.reply_text("Format: text | https://link", disable_web_page_preview=True)
         return
