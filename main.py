@@ -5,6 +5,34 @@ import requests
 
 
 
+
+# --- SOL price (USD) cache ---
+_SOL_PRICE_CACHE: Tuple[float, float] = (0.0, 0.0)  # (ts, price)
+_SOL_PRICE_TTL = int(os.getenv("SOL_PRICE_TTL_SEC", "120"))
+
+def get_sol_price_usd() -> float:
+    """Best-effort SOL/USD price via CoinGecko simple price. Cached."""
+    global _SOL_PRICE_CACHE
+    ts, price = _SOL_PRICE_CACHE
+    now = time.time()
+    if price > 0 and (now - ts) < _SOL_PRICE_TTL:
+        return price
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids":"solana","vs_currencies":"usd"},
+            timeout=10,
+        )
+        if r.ok:
+            j = r.json() or {}
+            p = float(((j.get("solana") or {}).get("usd")) or 0.0)
+            if p > 0:
+                _SOL_PRICE_CACHE = (now, p)
+                return p
+    except Exception:
+        pass
+    return price or 0.0
+
 # --- Solscan (holders) helper ---
 _SOLSCAN_HOLDERS_CACHE: Dict[str, Tuple[float, Optional[int]]] = {}
 _SOLSCAN_TTL_SEC = int(os.getenv("SOLSCAN_TTL_SEC", "300"))
@@ -90,6 +118,7 @@ BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 # Channels
 TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/PumpToolsTrending").strip()
 LISTING_URL = os.getenv("LISTING_URL", "https://t.me/PumpToolsListing").strip()
+LEADERBOARD_BUTTON_TEXT = os.getenv("LEADERBOARD_BUTTON_TEXT", "PumpTools Listing")
 
 BOT_BRAND = os.getenv("BOT_BRAND", "PumpTools").strip()
 BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
@@ -97,7 +126,7 @@ ADS_LINK_OVERRIDE = os.getenv("ADS_LINK", "").strip()
 DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/PumpToolsListing").strip()
 LEADERBOARD_HEADER_HANDLE = os.getenv("LEADERBOARD_HEADER_HANDLE", "@PumpToolsTrending").strip()
 
-TRENDING_POST_CHAT_ID = os.getenv("TRENDING_POST_CHAT_ID", "").strip()  # numeric id e.g. -100...
+TRENDING_POST_CHAT_ID = (os.getenv("TRENDING_POST_CHAT_ID","").strip() or os.getenv("TRENDING_POST_CHAT_ID","").strip() or os.getenv("TRENDING_POST_CHAT_ID","").strip())  # numeric id e.g. -100...
 MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() in ("1","true","yes","on")
 
 # Owner + payments
@@ -429,6 +458,107 @@ def _extract_memo_from_tx(tx: Dict[str, Any]) -> Optional[str]:
             continue
     return None
 
+
+def _compute_sol_in_from_wsol(tx: Dict[str, Any], buyer: str) -> float:
+    """Compute SOL spent from WSOL token outflow from buyer. Returns 0 if not found."""
+    if not buyer:
+        buyer = tx.get("feePayer") or ""
+    total = 0.0
+    for tt in tx.get("tokenTransfers") or []:
+        if (tt.get("mint") or "") != "So11111111111111111111111111111111111111112":
+            continue
+        frm = tt.get("fromUserAccount") or tt.get("userAccount") or ""
+        to = tt.get("toUserAccount") or ""
+        if frm == buyer and to and to != buyer:
+            try:
+                total += float(tt.get("tokenAmount") or 0.0)
+            except Exception:
+                pass
+    # Sometimes buyer spends from a WSOL ATA owned by buyer; Helius still marks fromUserAccount as ATA address.
+    # Fallback: if feePayer matches and there is exactly one WSOL outflow, sum all WSOL outflows.
+    if total <= 0:
+        outs = []
+        for tt in tx.get("tokenTransfers") or []:
+            if (tt.get("mint") or "") != "So11111111111111111111111111111111111111112":
+                continue
+            frm = tt.get("fromUserAccount") or ""
+            to = tt.get("toUserAccount") or ""
+            if frm and to and frm != to:
+                try:
+                    outs.append(float(tt.get("tokenAmount") or 0.0))
+                except Exception:
+                    pass
+        if len(outs) == 1:
+            total = outs[0]
+    return total
+
+
+# Common base mints on Solana
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+
+def _pick_spent_from_swap(ev: Dict[str, Any]) -> Tuple[float,str]:
+    """Return (amount, symbol) for the input currency of a swap."""
+    # SOL native input
+    native_in = (ev.get("nativeInput") or {}).get("amount")
+    if native_in:
+        return (_amount_to_sol(native_in), "SOL")
+    # Token inputs (WSOL/USDC/USDT etc)
+    token_inputs = ev.get("tokenInputs") or []
+    best_amt = 0.0
+    best_sym = ""
+    for t in token_inputs:
+        mint = (t.get("mint") or "")
+        raw = (t.get("rawTokenAmount") or {})
+        try:
+            amt = float(raw.get("tokenAmount"))
+        except Exception:
+            try:
+                amt = float(t.get("tokenAmount"))
+            except Exception:
+                amt = 0.0
+        if amt <= 0:
+            continue
+        sym = t.get("symbol") or ""
+        # Prefer stable/WSOL as spend currency
+        priority = 0
+        if mint == WSOL_MINT: priority = 3; sym = "WSOL"
+        elif mint == USDC_MINT: priority = 2; sym = "USDC"
+        elif mint == USDT_MINT: priority = 2; sym = "USDT"
+        else: priority = 1; sym = sym or mint[:4]
+        # choose by priority then amount
+        score = (priority, amt)
+        if score > (0 if not best_sym else (0), 0):  # dummy
+            pass
+    # We'll do a second pass to properly compare
+    best = (0, 0.0, "")
+    for t in token_inputs:
+        mint = (t.get("mint") or "")
+        raw = (t.get("rawTokenAmount") or {})
+        try:
+            amt = float(raw.get("tokenAmount"))
+        except Exception:
+            try:
+                amt = float(t.get("tokenAmount"))
+            except Exception:
+                amt = 0.0
+        if amt <= 0:
+            continue
+        sym = t.get("symbol") or ""
+        priority = 1
+        if mint == WSOL_MINT:
+            priority = 3; sym = "WSOL"
+        elif mint == USDC_MINT:
+            priority = 2; sym = "USDC"
+        elif mint == USDT_MINT:
+            priority = 2; sym = "USDT"
+        cand = (priority, amt, sym or mint[:4])
+        if cand > best:
+            best = cand
+    if best[0] > 0:
+        return (best[1], best[2])
+    return (0.0, "SOL")
 def _amount_to_sol(lamports: Any) -> float:
     try:
         return float(lamports) / LAMPORTS_PER_SOL
@@ -483,7 +613,9 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
     ev = (tx.get("events") or {}).get("swap") or {}
     token_outputs = ev.get("tokenOutputs") or []
     native_in = (ev.get("nativeInput") or {}).get("amount")
-    sol_in = _amount_to_sol(native_in) if native_in is not None else 0.0
+    buyer_fp = tx.get("feePayer") or ""
+    spent_amt, spent_sym = _pick_spent_from_swap(ev)
+    sol_in = spent_amt  # kept for backwards compatibility
 
     out_amt = None
     out_dec = None
@@ -525,6 +657,7 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
         "timestamp": tx.get("timestamp") or int(time.time()),
         "buyer": out_user or tx.get("feePayer") or "",
         "sol_in": sol_in,
+        "spent_sym": (spent_sym if "spent_sym" in locals() else "SOL"),
         "token_out": out_amt,
         "token_decimals": out_dec,
         "source": tx.get("source") or "",
@@ -625,15 +758,29 @@ def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Opt
     chart = token.get("chart") or md.get("url") or f"https://dexscreener.com/solana/{mint}"
 
     buyer = buy.get("buyer") or ""
-    sol_in = float(buy.get("sol_in") or 0.0)
+    spent_amt = float(buy.get("sol_in") or 0.0)
+    spent_sym = (buy.get("spent_sym") or "SOL").upper()
+
+    sol_price = get_sol_price_usd()
+    spent_usd_str = ""
+    if spent_amt > 0:
+        if spent_sym in ("SOL","WSOL") and sol_price:
+            spent_usd_str = f" (<b>${spent_amt*sol_price:.2f}</b>)"
+        elif spent_sym in ("USDC","USDT"):
+            spent_usd_str = f" (<b>${spent_amt:.2f}</b>)"
     tok_out = fmt_token_amt(float(buy.get("token_out") or 0.0), buy.get("token_decimals") or token.get("decimals"))
 
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
     liq = md.get("liquidityUsd")
+    holders = buy.get("holders")  # optional (not always available)
+    if not holders:
+        holders = solscan_get_holders(mint)
+
     price_line = f"Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "Price: -"
     liq_line = f"Liquidity: ${fmt_num(float(liq),0)}" if liq else "Liquidity: -"
     mcap_line = f"MCap: ${fmt_num(float(fdv),0)}" if fdv else "MCap: -"
+
     ad_text, ad_link = pick_ad_for_post(mint)
     if not ad_link:
         ad_link = _ads_deeplink(mint, app)
@@ -641,15 +788,15 @@ def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Opt
     # Group style (like your screenshot "3) Group buy style")
     return (
         f"<b>{html.escape(sym)} Buy!</b>\n"
-        f"{diamonds(sol_in)}\n\n"
-        f"Spent:  <b>{fmt_num(sol_in, 4)} SOL</b>\n"
+        f"{diamonds(spent_amt if spent_sym in ('SOL','WSOL') else 0.0)}\n\n"
+        f"Spent:  <b>{fmt_num(spent_amt, 4)} {spent_sym}</b>{spent_usd_str}\n"
         f"Got:    <b>{fmt_num(tok_out, 4)} {html.escape(sym)}</b>\n\n"
         f"<a href=\"{solscan_addr(buyer)}\">{html.escape(_short(buyer))}</a> | "
         f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n\n"
         f"{price_line}\n"
         f"{liq_line}\n"
         f"{mcap_line}\n"
-        f"\n"
+        f"{holders_line}\n\n"
         f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">TX</a> | "
         f"<a href=\"{_buy_link(mint)}\">GT</a> | "
         f"<a href=\"{chart}\">DexS</a> | "
@@ -673,6 +820,7 @@ def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: O
 
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
+    holders = buy.get("holders")
 
     price_line = f"💵 Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "💵 Price: -"
     mcap_line = f"💰 MarketCap: ${fmt_num(float(fdv),0)}" if fdv else "💰 MarketCap: -"
@@ -687,6 +835,7 @@ def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: O
         f"{checks}\n\n"
         f"▽  <b>{fmt_num(sol_in, 4)} SOL</b> ({usd_txt})\n"
         f"↩  <b>{fmt_num(tok_out, 4)} ${html.escape(sym)}</b>\n"
+        f"{holders_line}\n"
         f"👤 {html.escape(_short(buyer))}: +0.1% | <a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n"
         f"{price_line}\n"
         f"{mcap_line}\n\n"
@@ -713,17 +862,16 @@ def _format_time_left(expires_at: int) -> str:
         return f"{h}h {m}m"
     return f"{m}m"
 
+def _num_emoji(n: int) -> str:
+    return {
+        1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣",10:"🔟"
+    }.get(n, str(n))
+
 def build_leaderboard_text() -> str:
-    """
-    Style requested (code-block look):
-    🟢 @PumpToolsTrending
-    1□ - $SYMBOL | +0%
-    ...
-    divider after 3
-    """
+    """Leaderboard style like SpyTON: top 3, divider, then 4-10 with % change."""
     _clean_expired()
 
-    # Build a ranked list: first booked trending tokens, then fill with organic by 6h volume.
+    # Rank: booked first, then organic by 6h volume
     ranked: List[str] = []
     booked = list((BOOKINGS.get("trending", {}) or {}).keys())
     for mint in booked:
@@ -745,25 +893,48 @@ def build_leaderboard_text() -> str:
         ranked += [mint for _, mint in vols]
 
     ranked = ranked[:10]
-    # Fill placeholders
     while len(ranked) < 10:
         ranked.append("")
 
     handle = LEADERBOARD_HEADER_HANDLE or "@PumpToolsTrending"
-    lines = [f"🟢 {handle}"]
+    lines: List[str] = [f"🟢 {handle}"]
+
+    # compute pct from stored baseline mcap
+    changed = False
     for i in range(1, 11):
         mint = ranked[i-1]
         if mint and mint in TOKENS:
             sym = TOKENS[mint].get("symbol") or "SYMBOL"
-            pct = "+0%"
-            lines.append(f"{i}□  - ${sym}  | {pct}")
+            md = get_market_data(mint)
+            mcap = md.get("marketCap") or md.get("fdv") or 0
+            try:
+                mcap = float(mcap or 0)
+            except Exception:
+                mcap = 0.0
+            base = TOKENS[mint].get("lb_base_mcap")
+            if (base is None or float(base or 0) <= 0) and mcap > 0:
+                TOKENS[mint]["lb_base_mcap"] = mcap
+                base = mcap
+                changed = True
+            try:
+                base_f = float(base or 0)
+            except Exception:
+                base_f = 0.0
+            pct = 0.0
+            if base_f > 0 and mcap > 0:
+                pct = (mcap - base_f) / base_f * 100.0
+            pct_str = f"{pct:+.0f}%"
+            lines.append(f"{_num_emoji(i)}  -  ${sym} | {pct_str}")
         else:
-            lines.append(f"{i}□  - $SYMBOL  | +0%")
+            lines.append(f"{_num_emoji(i)}  -  $SYMBOL | +0%")
         if i == 3:
-            lines.append("------------------------------------------------")
+            lines.append("----------------------------------------")
 
-    # Use <pre> to keep alignment on Telegram
+    if changed:
+        _save_json(TOKENS_FILE, TOKENS)
+
     return "<pre>\n" + "\n".join(lines) + "\n</pre>"
+
 
 async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int]]:
     """Ensure a single leaderboard message exists in the trending channel and return (chat_id, message_id).
@@ -789,6 +960,7 @@ async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int
             chat_id=chat_id,
             text=build_leaderboard_text(),
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
             disable_web_page_preview=True,
         )
         LEADERBOARD_MSG.clear()
@@ -835,6 +1007,7 @@ async def leaderboard_loop(app: Application) -> None:
                 message_id=mid,
                 text=build_leaderboard_text(),
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
                 disable_web_page_preview=True,
             )
         except Exception as e:
@@ -1503,13 +1676,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if kind == "socials":
-            # Accept formats like:
-            #   tg=https://t.me/xxx website=https://site.com x=https://x.com/yyy
-            #   tg= https://t.me/xxx
-            #   Tg = https://t.me/xxx
+            # format: tg=<url> website=<url> x=<url>
             t = TOKENS.get(mint) or {}
-            pairs = re.findall(r'(?i)\b(tg|telegram|x|twitter|web|website)\s*=\s*(\S+)', txt)
-            for k, v in pairs:
+            for part in txt.split():
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
                 k = k.lower().strip()
                 v = v.strip()
                 if k in ("tg", "telegram"):
@@ -1646,54 +1818,6 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_tokens()
     await update.effective_message.reply_text(f"✅ Added {symbol}.\nNow set watch address:\n/setwatch {mint} <pool_or_bonding_curve_address>")
 
-
-async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner shortcut: /track <mint>
-    - fetch best pair from DexScreener
-    - set watch_address to pairAddress so buys will post
-    """
-    if not is_owner(update.effective_user.id):
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /track <mint>")
-        return
-    mint = context.args[0].strip()
-    try:
-        pairs = dexscreener_token_pairs(mint)
-    except Exception:
-        pairs = []
-    if not pairs:
-        await update.effective_message.reply_text("No pairs found for that mint.")
-        return
-    # choose best by 24h volume then liquidity
-    def score(p):
-        try:
-            v = float((p.get("volume") or {}).get("h24") or 0)
-        except Exception:
-            v = 0.0
-        try:
-            l = float((p.get("liquidity") or {}).get("usd") or 0)
-        except Exception:
-            l = 0.0
-        return (v, l)
-    best = sorted(pairs, key=score, reverse=True)[0]
-    base = (best.get("baseToken") or {})
-    sym = base.get("symbol") or "TOKEN"
-    name = base.get("name") or sym
-    pair_addr = best.get("pairAddress") or ""
-    TOKENS[mint] = {
-        **(TOKENS.get(mint) or {}),
-        "mint": mint,
-        "symbol": sym,
-        "name": name,
-        "pair": pair_addr,
-        "watch_address": pair_addr,
-        "chart": best.get("url") or (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"),
-        "kind": "solana",
-    }
-    save_tokens()
-    await update.effective_message.reply_text(f"✅ Tracking {sym} ({mint}).\nWatch: {pair_addr}")
-
 async def cmd_setwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -1729,6 +1853,18 @@ async def cmd_deltoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 
+
+def ensure_token_entry(mint: str) -> Dict[str, Any]:
+    """Ensure TOKENS has an entry for mint, using DexScreener market data if possible."""
+    if mint in TOKENS:
+        return TOKENS[mint]
+    md = get_market_data(mint)
+    sym = md.get("symbol") or md.get("baseSymbol") or md.get("baseTokenSymbol") or "TOKEN"
+    name = md.get("name") or md.get("baseName") or md.get("baseTokenName") or sym
+    t = {"mint": mint, "symbol": sym, "name": name, "telegram": DEFAULT_TOKEN_TG}
+    TOKENS[mint] = t
+    save_tokens()
+    return t
 async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -1736,9 +1872,7 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.effective_message.reply_text("Usage: /force_trending <mint> <duration> (example: 6h)")
         return
     mint = context.args[0].strip(); dur = context.args[1].strip().lower()
-    if mint not in TOKENS:
-        await update.effective_message.reply_text("Unknown mint.")
-        return
+    ensure_token_entry(mint)
     seconds = duration_key_to_seconds(dur)
     BOOKINGS.setdefault('trending', {})
     BOOKINGS['trending'][mint] = {'mint': mint, 'started_at': _now(), 'expires_at': _now()+seconds, 'paid_by': 'owner', 'tx': 'owner', 'duration_key': dur, 'price_sol': 0}
@@ -1758,9 +1892,7 @@ async def cmd_force_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("Usage: /force_ads <mint> <duration> <text | link>")
         return
     mint = context.args[0].strip(); dur = context.args[1].strip().lower(); rest = ' '.join(context.args[2:]).strip()
-    if mint not in TOKENS:
-        await update.effective_message.reply_text("Unknown mint.")
-        return
+    ensure_token_entry(mint)
     if '|' not in rest:
         await update.effective_message.reply_text("Format: text | https://link", disable_web_page_preview=True)
         return
@@ -2153,7 +2285,6 @@ def main() -> None:
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
-    application.add_handler(CommandHandler("track", cmd_track))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
     application.add_handler(CommandHandler("deltoken", cmd_deltoken))
     application.add_handler(CommandHandler("adset", cmd_adset))
