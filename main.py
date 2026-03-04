@@ -631,9 +631,15 @@ def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Opt
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
     liq = md.get("liquidityUsd")
+    holders = buy.get("holders")  # optional (not always available)
+    if not holders:
+        holders = solscan_get_holders(mint)
+
     price_line = f"Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "Price: -"
     liq_line = f"Liquidity: ${fmt_num(float(liq),0)}" if liq else "Liquidity: -"
     mcap_line = f"MCap: ${fmt_num(float(fdv),0)}" if fdv else "MCap: -"
+    holders_line = f"Holders: {fmt_num(float(holders),0)}" if holders else "Holders: -"
+
     ad_text, ad_link = pick_ad_for_post(mint)
     if not ad_link:
         ad_link = _ads_deeplink(mint, app)
@@ -649,7 +655,7 @@ def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Opt
         f"{price_line}\n"
         f"{liq_line}\n"
         f"{mcap_line}\n"
-        f"\n"
+        f"{holders_line}\n\n"
         f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">TX</a> | "
         f"<a href=\"{_buy_link(mint)}\">GT</a> | "
         f"<a href=\"{chart}\">DexS</a> | "
@@ -673,9 +679,11 @@ def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: O
 
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
+    holders = buy.get("holders")
 
     price_line = f"💵 Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "💵 Price: -"
     mcap_line = f"💰 MarketCap: ${fmt_num(float(fdv),0)}" if fdv else "💰 MarketCap: -"
+    holders_line = f"↩ {fmt_k(float(holders))} Holders" if holders else "↩ Holders: -"
 
     ad_text, ad_link = pick_ad_for_post(mint)
     if not ad_link:
@@ -687,6 +695,7 @@ def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: O
         f"{checks}\n\n"
         f"▽  <b>{fmt_num(sol_in, 4)} SOL</b> ({usd_txt})\n"
         f"↩  <b>{fmt_num(tok_out, 4)} ${html.escape(sym)}</b>\n"
+        f"{holders_line}\n"
         f"👤 {html.escape(_short(buyer))}: +0.1% | <a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n"
         f"{price_line}\n"
         f"{mcap_line}\n\n"
@@ -1503,13 +1512,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if kind == "socials":
-            # Accept formats like:
-            #   tg=https://t.me/xxx website=https://site.com x=https://x.com/yyy
-            #   tg= https://t.me/xxx
-            #   Tg = https://t.me/xxx
+            # format: tg=<url> website=<url> x=<url>
             t = TOKENS.get(mint) or {}
-            pairs = re.findall(r'(?i)\b(tg|telegram|x|twitter|web|website)\s*=\s*(\S+)', txt)
-            for k, v in pairs:
+            for part in txt.split():
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
                 k = k.lower().strip()
                 v = v.strip()
                 if k in ("tg", "telegram"):
@@ -1645,54 +1653,6 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     }
     save_tokens()
     await update.effective_message.reply_text(f"✅ Added {symbol}.\nNow set watch address:\n/setwatch {mint} <pool_or_bonding_curve_address>")
-
-
-async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner shortcut: /track <mint>
-    - fetch best pair from DexScreener
-    - set watch_address to pairAddress so buys will post
-    """
-    if not is_owner(update.effective_user.id):
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /track <mint>")
-        return
-    mint = context.args[0].strip()
-    try:
-        pairs = dexscreener_token_pairs(mint)
-    except Exception:
-        pairs = []
-    if not pairs:
-        await update.effective_message.reply_text("No pairs found for that mint.")
-        return
-    # choose best by 24h volume then liquidity
-    def score(p):
-        try:
-            v = float((p.get("volume") or {}).get("h24") or 0)
-        except Exception:
-            v = 0.0
-        try:
-            l = float((p.get("liquidity") or {}).get("usd") or 0)
-        except Exception:
-            l = 0.0
-        return (v, l)
-    best = sorted(pairs, key=score, reverse=True)[0]
-    base = (best.get("baseToken") or {})
-    sym = base.get("symbol") or "TOKEN"
-    name = base.get("name") or sym
-    pair_addr = best.get("pairAddress") or ""
-    TOKENS[mint] = {
-        **(TOKENS.get(mint) or {}),
-        "mint": mint,
-        "symbol": sym,
-        "name": name,
-        "pair": pair_addr,
-        "watch_address": pair_addr,
-        "chart": best.get("url") or (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}"),
-        "kind": "solana",
-    }
-    save_tokens()
-    await update.effective_message.reply_text(f"✅ Tracking {sym} ({mint}).\nWatch: {pair_addr}")
 
 async def cmd_setwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -2153,7 +2113,6 @@ def main() -> None:
     application.add_handler(CommandHandler("continue", cmd_continue))
     application.add_handler(CommandHandler("tokens", cmd_tokens))
     application.add_handler(CommandHandler("addtoken", cmd_addtoken))
-    application.add_handler(CommandHandler("track", cmd_track))
     application.add_handler(CommandHandler("setwatch", cmd_setwatch))
     application.add_handler(CommandHandler("deltoken", cmd_deltoken))
     application.add_handler(CommandHandler("adset", cmd_adset))
