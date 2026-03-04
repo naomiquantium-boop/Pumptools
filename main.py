@@ -3,6 +3,65 @@ import os, json, time, asyncio, logging, re, html, math, secrets
 from typing import Any, Dict, Optional, List, Tuple
 import requests
 
+
+
+# --- Solscan (holders) helper ---
+_SOLSCAN_HOLDERS_CACHE: Dict[str, Tuple[float, Optional[int]]] = {}
+_SOLSCAN_TTL_SEC = int(os.getenv("SOLSCAN_TTL_SEC", "300"))
+
+def solscan_get_holders(mint: str) -> Optional[int]:
+    """Best-effort holders count via Solscan public endpoints (no key).
+    Returns None if unavailable."""
+    if not mint:
+        return None
+    now = time.time()
+    cached = _SOLSCAN_HOLDERS_CACHE.get(mint)
+    if cached and (now - cached[0]) < _SOLSCAN_TTL_SEC:
+        return cached[1]
+
+    headers = {"accept": "application/json"}
+
+    # Try token meta first
+    try:
+        r = requests.get(
+            "https://public-api.solscan.io/token/meta",
+            params={"tokenAddress": mint},
+            headers=headers,
+            timeout=10,
+        )
+        if r.ok:
+            j = r.json()
+            for k in ("holder", "holders", "holderCount", "holdersCount"):
+                v = j.get(k) if isinstance(j, dict) else None
+                if isinstance(v, (int, float)) and v >= 0:
+                    val = int(v)
+                    _SOLSCAN_HOLDERS_CACHE[mint] = (now, val)
+                    return val
+    except Exception:
+        pass
+
+    # Fallback: holders list endpoint sometimes returns 'total'
+    try:
+        r = requests.get(
+            "https://public-api.solscan.io/token/holders",
+            params={"tokenAddress": mint, "limit": 1, "offset": 0},
+            headers=headers,
+            timeout=10,
+        )
+        if r.ok:
+            j = r.json()
+            if isinstance(j, dict):
+                v = j.get("total") or j.get("totalCount") or j.get("count")
+                if isinstance(v, (int, float)) and v >= 0:
+                    val = int(v)
+                    _SOLSCAN_HOLDERS_CACHE[mint] = (now, val)
+                    return val
+    except Exception:
+        pass
+
+    _SOLSCAN_HOLDERS_CACHE[mint] = (now, None)
+    return None
+
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -29,10 +88,14 @@ POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 
 # Channels
-TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/SpySolTrending").strip()
-LISTING_URL = os.getenv("LISTING_URL", "https://t.me/SpySolListing").strip()
-DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/SpySolEco").strip()
-LEADERBOARD_HEADER_HANDLE = os.getenv("LEADERBOARD_HEADER_HANDLE", "@SpySolTrending").strip()
+TRENDING_URL = os.getenv("TRENDING_URL", "https://t.me/PumpToolsTrending").strip()
+LISTING_URL = os.getenv("LISTING_URL", "https://t.me/PumpToolsListing").strip()
+
+BOT_BRAND = os.getenv("BOT_BRAND", "PumpTools").strip()
+BOT_USERNAME_ENV = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+ADS_LINK_OVERRIDE = os.getenv("ADS_LINK", "").strip()
+DEFAULT_TOKEN_TG = os.getenv("DEFAULT_TOKEN_TG", "https://t.me/PumpToolsListing").strip()
+LEADERBOARD_HEADER_HANDLE = os.getenv("LEADERBOARD_HEADER_HANDLE", "@PumpToolsTrending").strip()
 
 TRENDING_POST_CHAT_ID = os.getenv("TRENDING_POST_CHAT_ID", "").strip()  # numeric id e.g. -100...
 MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() in ("1","true","yes","on")
@@ -74,7 +137,7 @@ LEADERBOARD_ORGANIC_TOPN = max(5, int(os.getenv("LEADERBOARD_ORGANIC_TOPN", "10"
 
 # Ads under buy posts
 DEFAULT_AD_TEXT = os.getenv("DEFAULT_AD_TEXT", "Advertise here").strip()
-DEFAULT_AD_LINK = os.getenv("DEFAULT_AD_LINK", "https://t.me/vseeton").strip()
+DEFAULT_AD_LINK = os.getenv("DEFAULT_AD_LINK", "").strip()
 AD_ROTATE_SEC = max(15, int(os.getenv("AD_ROTATE_SEC", "60")))
 
 # DexScreener
@@ -408,6 +471,23 @@ def bubbles(sol_amt: float) -> str:
     n = max(1, min(22, int(math.ceil(sol_amt / 0.1))))
     return "🟢" * n
 
+
+def diamonds(sol_amt: float) -> str:
+    # 1 diamond per 0.1 SOL capped 12 (group style)
+    n = max(1, min(12, int(math.ceil(sol_amt / 0.1))))
+    return "💎" * n
+
+def fmt_k(x: float) -> str:
+    try:
+        x = float(x)
+    except Exception:
+        return "-"
+    if x >= 1_000_000:
+        return f"{x/1_000_000:.2f}M"
+    if x >= 1_000:
+        return f"{x/1_000:.2f}K"
+    return f"{x:.0f}"
+
 def fmt_num(x: float, decimals: int = 2) -> str:
     if x is None:
         return "-"
@@ -448,15 +528,36 @@ def pick_ad_for_post(token_mint: str) -> Tuple[str, str]:
     ad = ad_list[_ad_rotation_idx % len(ad_list)]
     return (ad.get("text") or DEFAULT_AD_TEXT, ad.get("link") or DEFAULT_AD_LINK)
 
-def build_buy_message(token: Dict[str, Any], buy: Dict[str, Any]) -> str:
+def _bot_username(app: Optional[Application]=None) -> str:
+    # Best-effort bot username for deep links (t.me/<bot>?start=...)
+    if BOT_USERNAME_ENV:
+        return BOT_USERNAME_ENV
+    try:
+        if app and getattr(app, "bot", None):
+            return (app.bot.username or "").lstrip("@")
+    except Exception:
+        pass
+    return ""
+
+def _ads_deeplink(mint: str, app: Optional[Application]=None) -> str:
+    if ADS_LINK_OVERRIDE:
+        return ADS_LINK_OVERRIDE
+    uname = _bot_username(app)
+    if uname:
+        return f"https://t.me/{uname}?start=ads_{mint}"
+    # fallback: channel listing link
+    return LISTING_URL
+
+def _buy_link(mint: str) -> str:
+    # Pump.fun is the common buy page; safe fallback if not a pump token
+    return f"https://pump.fun/coin/{mint}"
+
+def build_buy_message_group(token: Dict[str, Any], buy: Dict[str, Any], app: Optional[Application]=None) -> str:
     sym = token.get("symbol") or "TOKEN"
-    name = token.get("name") or sym
     mint = token.get("mint") or ""
-    tg = token.get("tg") or DEFAULT_TOKEN_TG
-    chart = token.get("chart") or ""
+    tg = token.get("telegram") or token.get("tg") or DEFAULT_TOKEN_TG
     md = get_market_data(mint)
-    if not chart:
-        chart = md.get("url") or f"https://dexscreener.com/solana/{mint}"
+    chart = token.get("chart") or md.get("url") or f"https://dexscreener.com/solana/{mint}"
 
     buyer = buy.get("buyer") or ""
     sol_in = float(buy.get("sol_in") or 0.0)
@@ -465,27 +566,85 @@ def build_buy_message(token: Dict[str, Any], buy: Dict[str, Any]) -> str:
     price_usd = md.get("priceUsd")
     fdv = md.get("fdv")
     liq = md.get("liquidityUsd")
-    mcap_line = f"💰 MCap/FDV: ${fmt_num(float(fdv),0)}" if fdv else "💰 MCap/FDV: -"
-    liq_line = f"💧 Liquidity: ${fmt_num(float(liq),0)}" if liq else "💧 Liquidity: -"
-    price_line = f"💵 Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "💵 Price: -"
+    holders = buy.get("holders")  # optional (not always available)
+    if not holders:
+        holders = solscan_get_holders(mint)
+
+    price_line = f"Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "Price: -"
+    liq_line = f"Liquidity: ${fmt_num(float(liq),0)}" if liq else "Liquidity: -"
+    mcap_line = f"MCap: ${fmt_num(float(fdv),0)}" if fdv else "MCap: -"
+    holders_line = f"Holders: {fmt_num(float(holders),0)}" if holders else "Holders: -"
 
     ad_text, ad_link = pick_ad_for_post(mint)
+    if not ad_link:
+        ad_link = _ads_deeplink(mint, app)
 
+    # Group style (like your screenshot "3) Group buy style")
     return (
-        f"| {html.escape(sym)} Buy!\n\n"
-        f"{bubbles(sol_in)}\n\n"
-        f"💎 <b>{fmt_num(sol_in, 4)} SOL</b>\n"
-        f"🪙 <b>{fmt_num(tok_out, 4)} {html.escape(sym)}</b>\n\n"
-        f"👤 <a href=\"{solscan_addr(buyer)}\">{html.escape(_short(buyer))}</a> | "
-        f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n"
+        f"<b>{html.escape(sym)} Buy!</b>\n"
+        f"{diamonds(sol_in)}\n\n"
+        f"Spent:  <b>{fmt_num(sol_in, 4)} SOL</b>\n"
+        f"Got:    <b>{fmt_num(tok_out, 4)} {html.escape(sym)}</b>\n\n"
+        f"<a href=\"{solscan_addr(buyer)}\">{html.escape(_short(buyer))}</a> | "
+        f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n\n"
+        f"{price_line}\n"
         f"{liq_line}\n"
         f"{mcap_line}\n"
-        f"{price_line}\n\n"
-        f"🔗 <a href=\"{chart}\">Chart</a> | <a href=\"{tg}\">Telegram</a> | <a href=\"{TRENDING_URL}\">Trending</a>\n\n"
-        f"— <a href=\"{ad_link}\">{html.escape(ad_text)}</a>"
+        f"{holders_line}\n\n"
+        f"<a href=\"{solscan_tx(buy.get('signature') or '')}\">TX</a> | "
+        f"<a href=\"{_buy_link(mint)}\">GT</a> | "
+        f"<a href=\"{chart}\">DexS</a> | "
+        f"<a href=\"{tg}\">Telegram</a> | "
+        f"<a href=\"{TRENDING_URL}\">Trending</a>\n\n"
+        f"ad: <a href=\"{ad_link}\">{html.escape(ad_text)}</a>"
     )
 
-# -------------------- LEADERBOARD --------------------
+def build_buy_message_channel(token: Dict[str, Any], buy: Dict[str, Any], app: Optional[Application]=None) -> str:
+    sym = token.get("symbol") or "TOKEN"
+    mint = token.get("mint") or ""
+    tg = token.get("telegram") or token.get("tg") or DEFAULT_TOKEN_TG
+    md = get_market_data(mint)
+    chart = token.get("chart") or md.get("url") or f"https://dexscreener.com/solana/{mint}"
+
+    buyer = buy.get("buyer") or ""
+    sol_in = float(buy.get("sol_in") or 0.0)
+    tok_out = fmt_token_amt(float(buy.get("token_out") or 0.0), buy.get("token_decimals") or token.get("decimals"))
+    usd_val = buy.get("usd_value")
+    usd_txt = f"${fmt_num(float(usd_val),2)}" if usd_val else "$XXX.XX"
+
+    price_usd = md.get("priceUsd")
+    fdv = md.get("fdv")
+    holders = buy.get("holders")
+
+    price_line = f"💵 Price: ${fmt_num(float(price_usd), 8)}" if price_usd else "💵 Price: -"
+    mcap_line = f"💰 MarketCap: ${fmt_num(float(fdv),0)}" if fdv else "💰 MarketCap: -"
+    holders_line = f"↩ {fmt_k(float(holders))} Holders" if holders else "↩ Holders: -"
+
+    ad_text, ad_link = pick_ad_for_post(mint)
+    if not ad_link:
+        ad_link = _ads_deeplink(mint, app)
+
+    checks = "✅" * 22
+    return (
+        f"<b>${html.escape(sym)} Buy!</b>\n\n"
+        f"{checks}\n\n"
+        f"▽  <b>{fmt_num(sol_in, 4)} SOL</b> ({usd_txt})\n"
+        f"↩  <b>{fmt_num(tok_out, 4)} ${html.escape(sym)}</b>\n"
+        f"{holders_line}\n"
+        f"👤 {html.escape(_short(buyer))}: +0.1% | <a href=\"{solscan_tx(buy.get('signature') or '')}\">Txn</a>\n"
+        f"{price_line}\n"
+        f"{mcap_line}\n\n"
+        f"💎 <a href=\"{LISTING_URL}\">Listing</a> | "
+        f"🐸 <a href=\"{_buy_link(mint)}\">Buy</a> | "
+        f"📊 <a href=\"{chart}\">Chart</a>\n"
+        f"ad: <a href=\"{ad_link}\">{html.escape(ad_text)}</a>"
+    )
+
+# Backward-compat for any old calls
+def build_buy_message(token: Dict[str, Any], buy: Dict[str, Any]) -> str:
+    return build_buy_message_group(token, buy, None)
+
+# -------------------- LEADERBOARD# -------------------- LEADERBOARD --------------------
 def _format_time_left(expires_at: int) -> str:
     sec = max(0, int(expires_at) - _now())
     h = sec // 3600
@@ -499,57 +658,56 @@ def _format_time_left(expires_at: int) -> str:
     return f"{m}m"
 
 def build_leaderboard_text() -> str:
+    """
+    Style requested (code-block look):
+    🟢 @PumpToolsTrending
+    1□ - $SYMBOL | +0%
+    ...
+    divider after 3
+    """
     _clean_expired()
-    lines: List[str] = []
-    lines.append(f"🏆 <b>{html.escape(LEADERBOARD_HEADER_HANDLE)} Leaderboard</b>")
-    lines.append("")
-    # Trending (paid)
-    t = BOOKINGS.get("trending", {}) or {}
-    if t:
-        lines.append("🔥 <b>Trending (Booked)</b>")
-        items = sorted(t.items(), key=lambda kv: kv[1].get("expires_at", 0), reverse=True)
-        for i,(mint, rec) in enumerate(items[:10], start=1):
-            tok = TOKENS.get(mint, {"symbol":"TOKEN","name":"Token"})
-            sym = tok.get("symbol") or "TOKEN"
-            md = get_market_data(mint)
-            vol6 = md.get("volumeH6")
-            vol_txt = f"${fmt_num(float(vol6),0)}" if vol6 else "-"
-            lines.append(f"{i}. <b>{html.escape(sym)}</b> | 6h Vol: {vol_txt} | ⏳ {_format_time_left(int(rec.get('expires_at',0)))}")
-        lines.append("")
-    # Organic top by DexScreener 6h volume for all tracked tokens
+
+    # Build a ranked list: first booked trending tokens, then fill with organic by 6h volume.
+    ranked: List[str] = []
+    booked = list((BOOKINGS.get("trending", {}) or {}).keys())
+    for mint in booked:
+        if mint in TOKENS:
+            ranked.append(mint)
+
     if TOKENS:
-        vols: List[Tuple[float,str]] = []
-        for mint, tok in TOKENS.items():
+        vols: List[Tuple[float, str]] = []
+        for mint in TOKENS.keys():
+            if mint in ranked:
+                continue
             md = get_market_data(mint)
             v = md.get("volumeH6") or 0
             try:
                 vols.append((float(v), mint))
             except Exception:
-                continue
-        vols.sort(reverse=True, key=lambda x: x[0])
-        lines.append("🌿 <b>Organic (Top 6h Volume)</b>")
-        for i,(v,mint) in enumerate(vols[:LEADERBOARD_ORGANIC_TOPN], start=1):
-            tok = TOKENS.get(mint, {"symbol":"TOKEN"})
-            sym = tok.get("symbol") or "TOKEN"
-            lines.append(f"{i}. <b>{html.escape(sym)}</b> | 6h Vol: ${fmt_num(v,0)}")
-        lines.append("")
-    lines.append(f"📌 Book: /trending  •  Ads: /ads")
-    return "\n".join(lines).strip()
+                pass
+        vols.sort(reverse=True)
+        ranked += [mint for _, mint in vols]
 
-async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int]]:
-    if not TRENDING_POST_CHAT_ID:
-        return None
-    try:
-        chat_id = int(TRENDING_POST_CHAT_ID)
-    except Exception:
-        return None
-    if LEADERBOARD_MSG.get("chat_id") == chat_id and LEADERBOARD_MSG.get("message_id"):
-        return chat_id, int(LEADERBOARD_MSG["message_id"])
-    # create one
-    msg = await app.bot.send_message(chat_id=chat_id, text=build_leaderboard_text(), parse_mode="HTML", disable_web_page_preview=True)
-    LEADERBOARD_MSG.update({"chat_id": chat_id, "message_id": msg.message_id})
-    _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
-    return chat_id, msg.message_id
+    ranked = ranked[:10]
+    # Fill placeholders
+    while len(ranked) < 10:
+        ranked.append("")
+
+    handle = LEADERBOARD_HEADER_HANDLE or "@PumpToolsTrending"
+    lines = [f"🟢 {handle}"]
+    for i in range(1, 11):
+        mint = ranked[i-1]
+        if mint and mint in TOKENS:
+            sym = TOKENS[mint].get("symbol") or "SYMBOL"
+            pct = "+0%"
+            lines.append(f"{i}□  - ${sym}  | {pct}")
+        else:
+            lines.append(f"{i}□  - $SYMBOL  | +0%")
+        if i == 3:
+            lines.append("------------------------------------------------")
+
+    # Use <pre> to keep alignment on Telegram
+    return "<pre>\n" + "\n".join(lines) + "\n</pre>"
 
 async def leaderboard_loop(app: Application) -> None:
     if not LEADERBOARD_ON:
@@ -612,13 +770,11 @@ def build_startgroup() -> str:
 def start_text() -> str:
     # Keep this as a single valid string (Railway will crash if a quote is left open).
     return (
-        "🎩 Welcome to the Major Buy Bot! 🎩\n\n"
+        f"🎩 Welcome to the {BOT_BRAND} Buy Bot! 🎩\n\n"
         "To enjoy the benefits of the fastest Buy Notifications, Premium Trending, and Community Trending, "
         "please add the bot to your group and follow the instructions.\n\n"
         "Note: Bot must be an Admin with write permissions. If no confirmation message appears after adding the bot "
-        "to your community chat, simply type /continue in your group!\n\n"
-        f"Trending: {TRENDING_URL}\n"
-        f"Listing: {LISTING_URL}"
+        "to your community chat, simply type /continue in your group!"
     )
 
 
@@ -628,18 +784,80 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args:
         arg0 = context.args[0].strip()
         if arg0.startswith("continue_"):
-            gid = arg0.split("_",1)[1]
+            gid = arg0.split("_", 1)[1]
             context.user_data["setup_group_id"] = gid
             context.user_data["awaiting_ca"] = True
             await update.effective_message.reply_text("➤ Send your SOL Contract Address:")
             return
 
+        if arg0.startswith("ads_"):
+            mint = arg0.split("_", 1)[1]
+            await update.effective_message.reply_text(
+                f"""📣 <b>Buy Alert Ads</b>
+
+Token: <code>{html.escape(mint)}</code>
+
+Book with:
+<code>/ads &lt;mint&gt; &lt;duration&gt;</code>
+
+Pricing:
+{html.escape(_pricing_text("ads"))}""",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        if arg0.startswith("trending_"):
+            mint = arg0.split("_", 1)[1]
+            await update.effective_message.reply_text(
+                f"""🔥 <b>Trending Booking</b>
+
+Token: <code>{html.escape(mint)}</code>
+
+Book with:
+<code>/trending &lt;mint&gt; &lt;duration&gt;</code>
+
+Pricing:
+{html.escape(_pricing_text("trending"))}""",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        if arg0 == "ads":
+            await update.effective_message.reply_text(
+                f"""📣 <b>Buy Alert Ads</b>
+
+Use:
+<code>/ads &lt;mint&gt; &lt;duration&gt;</code>
+
+Pricing:
+{html.escape(_pricing_text("ads"))}""",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
+        if arg0 == "trending":
+            await update.effective_message.reply_text(
+                f"""🔥 <b>Trending Booking</b>
+
+Use:
+<code>/trending &lt;mint&gt; &lt;duration&gt;</code>
+
+Pricing:
+{html.escape(_pricing_text("trending"))}""",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add me to your Group", url=build_startgroup())],
-        [InlineKeyboardButton("Trending Channel", url=TRENDING_URL), InlineKeyboardButton("Listing", url=LISTING_URL)],
+        [InlineKeyboardButton("Trending Channel", url=TRENDING_URL),
+         InlineKeyboardButton("Listing", url=LISTING_URL)],
     ])
     await update.effective_message.reply_text(start_text(), reply_markup=kb, disable_web_page_preview=True)
-
 
 async def cmd_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
@@ -698,6 +916,7 @@ def _settings_keyboard(mint: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("⬅️ Back", callback_data="cfg|back|0")],
     ])
 
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
@@ -707,17 +926,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Setting value input
     awaiting = context.user_data.get("awaiting_setting")
     if awaiting:
-        kind, mint = awaiting.get("kind"), awaiting.get("mint")
+        kind = awaiting.get("kind")
+        mint = awaiting.get("mint")
         gid = awaiting.get("group_id")
+        if not mint:
+            context.user_data.pop("awaiting_setting", None)
+            return
+
         if kind == "emoji":
             _group_token_settings(gid, mint)["emoji"] = txt[:6]
             save_groups()
             context.user_data.pop("awaiting_setting", None)
             await msg.reply_text("✅ Emoji updated.", reply_markup=_settings_keyboard(mint))
             return
+
         if kind == "minbuy":
             try:
-                val = float(txt.replace("$","").strip())
+                val = float(txt.replace("$", "").strip())
             except Exception:
                 await msg.reply_text("Send a number like 15")
                 return
@@ -726,11 +951,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data.pop("awaiting_setting", None)
             await msg.reply_text("✅ Min buy updated.", reply_markup=_settings_keyboard(mint))
             return
+
         if kind == "steps":
-            # comma separated
-            parts=[p.strip() for p in txt.replace("$","").split(",") if p.strip()]
+            parts = [p.strip() for p in txt.replace("$", "").split(",") if p.strip()]
             try:
-                vals=[float(p) for p in parts]
+                vals = [float(p) for p in parts]
             except Exception:
                 await msg.reply_text("Send values like: 15,50,100")
                 return
@@ -739,22 +964,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data.pop("awaiting_setting", None)
             await msg.reply_text("✅ Buy steps updated.", reply_markup=_settings_keyboard(mint))
             return
+
+        if kind == "mediafile":
+            if txt.lower() == "remove":
+                t = TOKENS.get(mint) or {}
+                t.pop("media_type", None)
+                t.pop("media_file_id", None)
+                TOKENS[mint] = t
+                save_tokens()
+                context.user_data.pop("awaiting_setting", None)
+                await msg.reply_text("✅ Media removed.", reply_markup=_settings_keyboard(mint))
+                return
+            await msg.reply_text("Send a photo/video/GIF for media (or type 'remove' to clear).")
+            return
+
         if kind == "socials":
             # format: tg=<url> website=<url> x=<url>
             t = TOKENS.get(mint) or {}
             for part in txt.split():
-                if "=" not in part: 
+                if "=" not in part:
                     continue
-                k,v = part.split("=",1)
-                k=k.lower().strip()
-                v=v.strip()
-                if k in ("tg","telegram"):
-                    t["telegram"]=v
-                elif k in ("x","twitter"):
-                    t["twitter"]=v
-                elif k in ("web","website"):
-                    t["website"]=v
-            TOKENS[mint]=t
+                k, v = part.split("=", 1)
+                k = k.lower().strip()
+                v = v.strip()
+                if k in ("tg", "telegram"):
+                    t["telegram"] = v
+                elif k in ("x", "twitter"):
+                    t["twitter"] = v
+                elif k in ("web", "website"):
+                    t["website"] = v
+            TOKENS[mint] = t
             save_tokens()
             context.user_data.pop("awaiting_setting", None)
             await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint))
@@ -776,127 +1015,66 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # store candidates in user_data, show top 6 by volume
-        def vol24(p):
-            try: return float((p.get("volume") or {}).get("h24") or 0)
-            except Exception: return 0.0
-        pairs_sorted = sorted(pairs, key=vol24, reverse=True)[:6]
-        context.user_data["pair_candidates"] = pairs_sorted
+        def vol(p):
+            try:
+                return float((p.get("volume") or {}).get("h24") or 0)
+            except Exception:
+                return 0.0
+
+        pairs = sorted(pairs, key=vol, reverse=True)[:6]
         context.user_data["pending_mint"] = mint
-        context.user_data["awaiting_ca"] = False
-
-        buttons=[]
-        for i,p in enumerate(pairs_sorted):
-            base = (p.get("baseToken") or {}).get("symbol") or "TOKEN"
-            quote = (p.get("quoteToken") or {}).get("symbol") or ""
-            dex = (p.get("dexId") or "").replace("-", " ").title() or "DEX"
-            v = vol24(p)
-            label=f"{base} - {quote} - ({dex} V: {fmt_num(v,1)})"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"pair|{i}")])
-        buttons.append([InlineKeyboardButton("Back", callback_data="pair|back")])
-        await msg.reply_text("➤ Match found! Confirm your pair below:", reply_markup=InlineKeyboardMarkup(buttons))
+        context.user_data["pair_candidates"] = pairs
+        btns = []
+        for i, p in enumerate(pairs):
+            base = (p.get("baseToken") or {})
+            sym = base.get("symbol") or "TOKEN"
+            quote = (p.get("quoteToken") or {}).get("symbol") or "SOL"
+            dex = (p.get("dexId") or "").title()
+            v = vol(p)
+            vtxt = fmt_k(v)
+            btns.append([InlineKeyboardButton(f"{sym} - {quote} - ({dex} V: {vtxt})", callback_data=f"pair|{i}")])
+        btns.append([InlineKeyboardButton("Back", callback_data="pair|back")])
+        await msg.reply_text("➤ Match found! Confirm your pair below:", reply_markup=InlineKeyboardMarkup(btns))
         return
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q:
+
+async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
         return
-    data = q.data or ""
-    await q.answer()
-
-    # Pair selection
-    if data.startswith("pair|"):
-        if data == "pair|back":
-            context.user_data["awaiting_ca"] = True
-            await q.edit_message_text("➤ Send your SOL Contract Address:")
-            return
-        try:
-            idx = int(data.split("|",1)[1])
-        except Exception:
-            return
-        pairs = context.user_data.get("pair_candidates") or []
-        if idx < 0 or idx >= len(pairs):
-            return
-        p = pairs[idx]
-        mint = context.user_data.get("pending_mint")
-        if not mint:
-            return
-        base = (p.get("baseToken") or {})
-        symbol = base.get("symbol") or "TOKEN"
-        name = base.get("name") or symbol
-        pair_addr = p.get("pairAddress") or ""
-        url = p.get("url") or f"https://dexscreener.com/solana/{mint}"
-
-        # attach to group (from deep link)
-        gid = str(context.user_data.get("setup_group_id") or "")
-        if not gid:
-            gid = "0"
-
-        TOKENS[mint] = {
-            "mint": mint,
-            "symbol": symbol,
-            "name": name,
-            "watch_address": pair_addr or "",
-            "chart": url,
-            "telegram": "",
-            "decimals": 9,
-        }
-        save_tokens()
-        _group_token_settings(gid, mint)
-
-        await q.edit_message_text("⚙️ Settings\n\nChoose from the following options to customize your Buy Bot:", reply_markup=_settings_keyboard(mint))
+    awaiting = context.user_data.get("awaiting_setting")
+    if not awaiting or awaiting.get("kind") != "mediafile":
         return
 
-    # Settings menu
-    if data.startswith("cfg|"):
-        parts = data.split("|")
-        if len(parts) < 3:
-            return
-        mint = parts[1]
-        action = parts[2]
-        gid = str(context.user_data.get("setup_group_id") or "0")
+    mint = awaiting.get("mint")
+    if not mint:
+        return
 
-        if action == "emoji":
-            context.user_data["awaiting_setting"] = {"kind":"emoji","mint":mint,"group_id":gid}
-            await q.edit_message_text("Send the emoji you want (example: 🎩)")
-            return
-        if action == "minbuy":
-            context.user_data["awaiting_setting"] = {"kind":"minbuy","mint":mint,"group_id":gid}
-            await q.edit_message_text("Send the minimum buy in USD (example: 15)")
-            return
-        if action == "steps":
-            context.user_data["awaiting_setting"] = {"kind":"steps","mint":mint,"group_id":gid}
-            await q.edit_message_text("Send buy steps as comma-separated USD values (example: 15,50,100)")
-            return
-        if action in ("media","chart","notif"):
-            s=_group_token_settings(gid, mint)
-            key={"media":"show_media","chart":"show_chart","notif":"show_notifications"}[action]
-            s[key]=not bool(s.get(key, True))
-            save_groups()
-            await q.edit_message_reply_markup(reply_markup=_settings_keyboard(mint))
-            return
-        if action == "socials":
-            context.user_data["awaiting_setting"] = {"kind":"socials","mint":mint,"group_id":gid}
-            await q.edit_message_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name")
-            return
-        if action == "delete":
-            # Remove token from TOKENS and group mapping
-            TOKENS.pop(mint, None)
-            save_tokens()
-            g = GROUPS.get(gid) or {}
-            tmap = g.get("tokens") or {}
-            tmap.pop(mint, None)
-            if "tokens" in g:
-                g["tokens"]=tmap
-            GROUPS[gid]=g
-            save_groups()
-            await q.edit_message_text("🗑️ Token deleted.")
-            return
-        if action == "supply":
-            await q.edit_message_text("Total supply is auto (coming soon).", reply_markup=_settings_keyboard(mint))
-            return
-        if action == "0":
-            await q.edit_message_text(start_text())
-            return
+    t = TOKENS.get(mint) or {}
+    media_type = None
+    file_id = None
+
+    if msg.photo:
+        media_type = "photo"
+        file_id = msg.photo[-1].file_id
+    elif msg.video:
+        media_type = "video"
+        file_id = msg.video.file_id
+    elif msg.animation:
+        media_type = "animation"
+        file_id = msg.animation.file_id
+
+    if not media_type or not file_id:
+        await msg.reply_text("Please send a photo, video, or GIF.")
+        return
+
+    t["media_type"] = media_type
+    t["media_file_id"] = file_id
+    TOKENS[mint] = t
+    save_tokens()
+    context.user_data.pop("awaiting_setting", None)
+    await msg.reply_text("✅ Media updated.", reply_markup=_settings_keyboard(mint))
+
 
 async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not TOKENS:
@@ -1116,7 +1294,7 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # -------------------- GROUP ACTIVITY --------------------
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # When the bot is added to a group, store group and post "continue" button like Major Buy Bot.
+    # When the bot is added to a group, store group and post "continue" button like PumpTools Buy Bot.
     chat = update.effective_chat
     if not chat or chat.type not in ("group","supergroup"):
         return
@@ -1145,9 +1323,14 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # -------------------- BUY POLLER --------------------
 async def buy_poller(app: Application) -> None:
+    """
+    Poll Helius Enhanced Transactions by watch address.
+    IMPORTANT: prevent "old buy spam" by keeping a per-token cursor signature.
+    """
     if not HELIUS_API_KEY:
         log.warning("HELIUS_API_KEY not set; buy detection disabled.")
         return
+
     while True:
         try:
             _clean_expired()
@@ -1155,43 +1338,105 @@ async def buy_poller(app: Application) -> None:
                 watch = (tok.get("watch_address") or "").strip()
                 if not watch:
                     continue
+
                 try:
                     txs = helius_get_transactions_by_address(watch, limit=20)
                 except Exception:
                     continue
-                # newest first -> process old to new
-                for tx in reversed(txs):
-                    sig = tx.get("signature") or ""
+                if not txs:
+                    continue
+
+                last_sig = (tok.get("last_sig") or "").strip()
+
+                # First run for this token: set cursor to newest and DO NOT backfill.
+                newest_sig = (txs[0].get("signature") or "").strip()
+                if not last_sig and newest_sig:
+                    tok["last_sig"] = newest_sig
+                    TOKENS[mint] = tok
+                    save_tokens()
+                    continue
+
+                # Collect new txs newer than last_sig
+                new_txs = []
+                for tx in txs:  # newest -> oldest
+                    sig = (tx.get("signature") or "").strip()
+                    if not sig:
+                        continue
+                    if sig == last_sig:
+                        break
+                    new_txs.append(tx)
+
+                if not new_txs:
+                    continue
+
+                # Update cursor to newest we saw
+                tok["last_sig"] = (new_txs[0].get("signature") or newest_sig)
+                TOKENS[mint] = tok
+                save_tokens()
+
+                # Process old -> new
+                for tx in reversed(new_txs):
+                    sig = (tx.get("signature") or "").strip()
                     if not sig or sig in SEEN:
                         continue
                     SEEN[sig] = time.time()
                     buy = parse_buy_from_tx(tx, mint)
                     if not buy:
                         continue
-                    msg = build_buy_message(tok, buy)
-                    await broadcast_buy(app, msg)
+                    await broadcast_buy(app, mint, buy)
+
             _save_json(SEEN_FILE, SEEN)
         except Exception as e:
             log.warning("buy_poller error: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
 
-async def broadcast_buy(app: Application, text: str) -> None:
+async def _send_buy_to_chat(app: Application, chat_id: int, mint: str, buy: Dict[str, Any], is_channel: bool) -> None:
+    tok = TOKENS.get(mint) or {}
+    # group_id for settings: chat_id string; for channel use "0"
+    gid = "0" if is_channel else str(chat_id)
+    s = _group_token_settings(gid, mint)
+    show_media = bool(s.get("show_media", True))
+
+    text = build_buy_message_channel(tok, buy, app) if is_channel else build_buy_message_group(tok, buy, app)
+
+    media_type = tok.get("media_type")
+    media_file = tok.get("media_file_id")
+
+    if show_media and media_type and media_file:
+        try:
+            if media_type == "photo":
+                await app.bot.send_photo(chat_id=chat_id, photo=media_file, caption=text, parse_mode="HTML")
+                return
+            if media_type == "video":
+                await app.bot.send_video(chat_id=chat_id, video=media_file, caption=text, parse_mode="HTML")
+                return
+            if media_type == "animation":
+                await app.bot.send_animation(chat_id=chat_id, animation=media_file, caption=text, parse_mode="HTML")
+                return
+        except Exception:
+            # fallback to plain message
+            pass
+
+    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+
+async def broadcast_buy(app: Application, mint: str, buy: Dict[str, Any]) -> None:
     # send to all enabled groups
     for chat_id, cfg in (GROUPS or {}).items():
         try:
             if not (cfg or {}).get("enabled", True):
                 continue
-            await app.bot.send_message(chat_id=int(chat_id), text=text, parse_mode="HTML", disable_web_page_preview=True)
+            await _send_buy_to_chat(app, int(chat_id), mint, buy, is_channel=False)
         except Exception:
             continue
+
     # mirror into trending channel
     if MIRROR_TO_TRENDING and TRENDING_POST_CHAT_ID:
         try:
-            await app.bot.send_message(chat_id=int(TRENDING_POST_CHAT_ID), text=text, parse_mode="HTML", disable_web_page_preview=True)
+            await _send_buy_to_chat(app, int(TRENDING_POST_CHAT_ID), mint, buy, is_channel=True)
         except Exception:
             pass
 
-# -------------------- HEALTHCHECK --------------------
+# -------------------- HEALTHCHECK# -------------------- HEALTHCHECK --------------------
 # Railway doesn't require an HTTP server for Telegram polling bots.
 # But if you want a health endpoint, we run Flask in a *separate thread*
 # so it never blocks the asyncio event loop used by python-telegram-bot.
@@ -1245,6 +1490,7 @@ def main() -> None:
     application.add_handler(CommandHandler("ads", cmd_ads))
     application.add_handler(CommandHandler("confirm", cmd_confirm))
     application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION) & ~filters.COMMAND, on_media))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
