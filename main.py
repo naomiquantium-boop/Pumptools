@@ -141,7 +141,9 @@ MIRROR_TO_TRENDING = str(os.getenv("MIRROR_TO_TRENDING", "1")).strip().lower() i
 
 # Owner + payments
 OWNER_IDS = [int(x) for x in re.split(r"[ ,;]+", os.getenv("OWNER_IDS", "").strip()) if x.strip().isdigit()]
-PAY_WALLET = os.getenv("PAY_WALLET", "").strip()  # Solana address to receive SOL
+# Solana address to receive SOL. If you don't set PAY_WALLET in env,
+# we fall back to your PumpTools wallet so the bot works out-of-the-box.
+PAY_WALLET = os.getenv("PAY_WALLET", "3nuVyrqMLvxLx8finrRLH3zWufJk7AKAWZroH7upwDdQ").strip()
 # Owner fallback (if OWNER_IDS env not set): allow claiming owner once and persist to file
 DATA_DIR = os.getenv("DATA_DIR", ".")
 OWNER_IDS_FILE = os.path.join(DATA_DIR or ".", "owner_ids.json")
@@ -2050,7 +2052,33 @@ async def cmd_addtoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "kind": "solana",
     }
     save_tokens()
-    await update.effective_message.reply_text(f"✅ Added {symbol}.\nNow set watch address:\n/setwatch {mint} <pool_or_bonding_curve_address>")
+    # Try to auto-resolve a good watch address for buy detection.
+    # We prefer the DexScreener pairAddress (pool) because the token mint itself often won't have swap signatures.
+    pair_addr = ""
+    try:
+        pairs = dexscreener_token_pairs(mint) or []
+        for p in pairs:
+            pa = (p.get("pairAddress") or "").strip()
+            if pa:
+                pair_addr = pa
+                break
+    except Exception:
+        pair_addr = ""
+
+    if pair_addr:
+        TOKENS[mint]["watch_address"] = pair_addr
+        save_tokens()
+
+    if pair_addr:
+        await update.effective_message.reply_text(
+            f"✅ Added {symbol}.\n✅ Auto watch set: {pair_addr}\nBuys should start posting soon.",
+            disable_web_page_preview=True,
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"✅ Added {symbol}.\nNow set watch address:\n/setwatch {mint} <pool_or_bonding_curve_address>",
+            disable_web_page_preview=True,
+        )
 
 async def cmd_setwatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
