@@ -1398,6 +1398,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # ----- Settings callbacks -----
+    # Socials submenu callbacks
+    if data.startswith("soc|"):
+        parts = data.split("|")
+        if len(parts) < 3:
+            return
+        mint = parts[1]
+        kind = parts[2]
+        gid = context.user_data.get("setup_group_id")
+        if kind == "tg":
+            context.user_data["awaiting_setting"] = {"kind": "social_tg", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send Telegram link (example: https://t.me/yourchat)", disable_web_page_preview=True)
+            return
+        if kind == "x":
+            context.user_data["awaiting_setting"] = {"kind": "social_x", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send Twitter/X link (example: https://x.com/name)", disable_web_page_preview=True)
+            return
+        if kind == "web":
+            context.user_data["awaiting_setting"] = {"kind": "social_web", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send Website link (example: https://site.com)", disable_web_page_preview=True)
+            return
+        return
     if data.startswith("cfg|"):
         parts = data.split("|")
         if len(parts) >= 2 and parts[1] == "back":
@@ -1459,8 +1480,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         if action == "socials":
-            context.user_data["awaiting_setting"] = {"kind": "socials", "mint": mint, "group_id": gid}
-            await q.message.reply_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name", disable_web_page_preview=True)
+            # Show socials submenu like Major (Telegram / X / Website)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Telegram", callback_data=f"soc|{mint}|tg"),
+                 InlineKeyboardButton("✅ Website", callback_data=f"soc|{mint}|web")],
+                [InlineKeyboardButton("✅ Twitter / X", callback_data=f"soc|{mint}|x")],
+                [InlineKeyboardButton("⬅ Back", callback_data=f"cfg|{mint}|back")]
+            ])
+            await q.message.reply_text("➡️ Add or update social links:", reply_markup=kb, disable_web_page_preview=True)
             return
 
         if action == "delete":
@@ -1600,7 +1627,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mint = parse_first_base58(text_in) or text_in.strip().split()[0].strip()
         flow = context.user_data.get("booking_flow") or {}
         # Auto-create token entry if missing (token CA == mint on Solana)
-        ensure_token_entry(mint)
+        t = ensure_token_entry(mint)
+    # auto-set watch address if missing so buys can post
+    if not (t.get("watch_address") or t.get("pair") or t.get("pair_address")):
+        md = get_market_data(mint)
+        pair_addr = md.get("pairAddress") or md.get("pair_address")
+        if pair_addr:
+            t["watch_address"] = pair_addr
+            t["pair"] = pair_addr
+            t["pair_address"] = pair_addr
+            save_tokens()
+
         kind = flow.get("kind")
         dur = flow.get("duration")
         price = float(flow.get("price") or 0)
@@ -1760,13 +1797,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if kind == "socials":
-            # format: tg=<url> website=<url> x=<url>
+            # Accept: tg=<url> website=<url> x=<url> (spaces around '=' allowed)
             t = TOKENS.get(mint) or {}
-            for part in txt.split():
-                if "=" not in part:
-                    continue
-                k, v = part.split("=", 1)
-                k = k.lower().strip()
+            pairs = re.findall(r"(tg|telegram|x|twitter|web|website)\s*=\s*(\S+)", txt, flags=re.IGNORECASE)
+            for k, v in pairs:
+                k = k.lower()
                 v = v.strip()
                 if k in ("tg", "telegram"):
                     t["telegram"] = v
@@ -1780,6 +1815,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
             return
 
+        if kind == "social_tg":
+            t = TOKENS.get(mint) or {}
+            t["telegram"] = txt.strip()
+            TOKENS[mint] = t
+            save_tokens()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Telegram link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
+            return
+
+        if kind == "social_x":
+            t = TOKENS.get(mint) or {}
+            t["twitter"] = txt.strip()
+            TOKENS[mint] = t
+            save_tokens()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Twitter/X link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
+            return
+
+        if kind == "social_web":
+            t = TOKENS.get(mint) or {}
+            t["website"] = txt.strip()
+            TOKENS[mint] = t
+            save_tokens()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Website link has been updated.", reply_markup=_settings_keyboard(mint), disable_web_page_preview=True)
+            return
         if kind == "supply":
             try:
                 val = float(txt.replace(",", "").strip())
