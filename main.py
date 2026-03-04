@@ -970,6 +970,102 @@ def build_leaderboard_html() -> str:
         lines.append("No tokens yet.")
         return "\n".join(lines)
 
+# --- Trending channel resolution + persistent single-message leaderboard ---
+
+async def get_trending_chat_id(app: Application):
+    """Resolve TRENDING_POST_CHAT_ID which may be:
+    - numeric chat id (-100...)
+    - @username
+    - https://t.me/username
+    Returns a chat_id suitable for bot API calls (int or str)."""
+    raw = (TRENDING_POST_CHAT_ID or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
+        raw = raw.split("/", 3)[-1].split("?")[0].split("#")[0]
+        raw = "@" + raw.lstrip("@")
+    try:
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+    except Exception:
+        pass
+    return raw
+
+
+async def ensure_leaderboard_message(app: Application):
+    """Ensure a single leaderboard message exists and return (chat_id, message_id).
+    Stores the reference in LEADERBOARD_MSG_FILE so we always edit the same message."""
+    if not (LEADERBOARD_ON and TRENDING_POST_CHAT_ID):
+        return None
+
+    chat_id = await get_trending_chat_id(app)
+    if not chat_id:
+        return None
+
+    # Env override (useful without a persistent DATA_DIR volume)
+    env_mid = os.getenv("LEADERBOARD_MESSAGE_ID", "").strip()
+    env_cid = os.getenv("LEADERBOARD_CHAT_ID", "").strip()
+    if env_mid:
+        try:
+            mid = int(env_mid)
+            if env_cid:
+                cid2 = int(env_cid) if env_cid.lstrip("-").isdigit() else env_cid
+                if str(cid2) != str(chat_id):
+                    raise ValueError("LEADERBOARD_CHAT_ID mismatch")
+            LEADERBOARD_MSG.clear()
+            LEADERBOARD_MSG.update({"chat_id": str(chat_id), "message_id": mid})
+            _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
+            return (chat_id, mid)
+        except Exception:
+            pass
+
+    # Previously saved?
+    try:
+        mid = int((LEADERBOARD_MSG or {}).get("message_id") or 0)
+        cid = (LEADERBOARD_MSG or {}).get("chat_id")
+        if mid and cid and str(cid) == str(chat_id):
+            return (chat_id, mid)
+    except Exception:
+        pass
+
+    # Create new message
+    try:
+        msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=build_leaderboard_html(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
+        )
+        LEADERBOARD_MSG.clear()
+        LEADERBOARD_MSG.update({"chat_id": str(chat_id), "message_id": msg.message_id})
+        _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
+        return (chat_id, msg.message_id)
+    except Exception as e:
+        log.warning("Failed to create leaderboard message: %s", e)
+        return None
+
+
+async def leaderboard_loop(app: Application) -> None:
+    if not (LEADERBOARD_ON and TRENDING_POST_CHAT_ID):
+        return
+    while True:
+        try:
+            ref = await ensure_leaderboard_message(app)
+            if ref:
+                chat_id, mid = ref
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=build_leaderboard_html(),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
+                )
+        except Exception as e:
+            log.warning("leaderboard_loop error: %s", e)
+        await asyncio.sleep(LEADERBOARD_INTERVAL)
+
     # helper percent change based on stored baseline mcap
     def pct(mint: str) -> str:
         base = (TOKENS.get(mint, {}) or {}).get("lb_base_mcap")
