@@ -108,6 +108,13 @@ PAY_WALLET = os.getenv("PAY_WALLET", "").strip()  # Solana address to receive SO
 TRENDING_PRICES = os.getenv("TRENDING_PRICES", "1h=0.2,6h=0.8,24h=2.5").strip()
 ADS_PRICES = os.getenv("ADS_PRICES", "1d=0.5,3d=1.2,7d=2.5").strip()
 
+
+# Package pricing for interactive /trending & /ads flows (defaults match your screenshots)
+TOP3_PRICES = os.getenv("TOP3_PRICES", "2h=0.14,3h=0.73,6h=1.47,12h=2.03,24h=2.92").strip()
+TOP10_PRICES = os.getenv("TOP10_PRICES", "3h=0.46,6h=1.09,12h=1.37,24h=2.19").strip()
+ADS_PACKAGES = os.getenv("ADS_PACKAGES", "6h=1,12h=1.5,24h=3").strip()
+
+
 # Data files
 DATA_DIR = os.getenv("DATA_DIR", "").strip()
 def _data_path(p: str) -> str:
@@ -181,6 +188,21 @@ def _parse_price_map(s: str) -> Dict[str, float]:
 
 TRENDING_PRICE_MAP = _parse_price_map(TRENDING_PRICES)
 ADS_PRICE_MAP = _parse_price_map(ADS_PRICES)
+# Interactive package maps
+TOP3_PRICE_MAP = _parse_price_map(TOP3_PRICES)
+TOP10_PRICE_MAP = _parse_price_map(TOP10_PRICES)
+ADS_PACKAGE_MAP = _parse_price_map(ADS_PACKAGES)
+
+_ALPH = "ABCDEFGH23456789"
+
+def _mk_ref(kind: str) -> str:
+    # kind: trending|ads
+    import secrets
+    tail = "".join(secrets.choice(_ALPH) for _ in range(5))
+    if kind == "trending":
+        return f"PT-TRND-{tail}"
+    return f"PT-ADS-{tail}"
+
 
 # -------------------- STATE --------------------
 TOKENS: Dict[str, Dict[str, Any]] = {}          # mint -> token dict
@@ -291,6 +313,26 @@ def _mk_invoice(kind: str, mint: str, duration_key: str, price_sol: float, chat_
         "user_id": user_id,
     }
     INVOICES[invoice_id] = inv
+    _save_json(INVOICES_FILE, INVOICES)
+    return inv
+
+
+def _mk_invoice_ref(kind: str, mint: str, duration_key: str, price_sol: float, chat_id: int, user_id: int) -> Dict[str, Any]:
+    # Create invoice with a human reference id (PT-TRND-XXXXX / PT-ADS-XXXXX).
+    ref = _mk_ref(kind)
+    inv = {
+        "id": ref,
+        "kind": kind,
+        "mint": mint,
+        "duration_key": duration_key,
+        "price_sol": price_sol,
+        "pay_wallet": PAY_WALLET,
+        "created_at": _now(),
+        "status": "pending",
+        "chat_id": chat_id,
+        "user_id": user_id,
+    }
+    INVOICES[ref] = inv
     _save_json(INVOICES_FILE, INVOICES)
     return inv
 
@@ -709,6 +751,41 @@ def build_leaderboard_text() -> str:
     # Use <pre> to keep alignment on Telegram
     return "<pre>\n" + "\n".join(lines) + "\n</pre>"
 
+async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int]]:
+    """Ensure a single leaderboard message exists in the trending channel and return (chat_id, message_id).
+    Stores the reference in LEADERBOARD_MSG_FILE so we edit the same message (no spam)."""
+    if not TRENDING_POST_CHAT_ID:
+        return None
+    try:
+        chat_id = int(TRENDING_POST_CHAT_ID)
+    except Exception:
+        return None
+
+    # If we already have a message id, use it
+    try:
+        mid = int((LEADERBOARD_MSG or {}).get("message_id") or 0)
+        cid = int((LEADERBOARD_MSG or {}).get("chat_id") or 0)
+        if mid and cid == chat_id:
+            return (chat_id, mid)
+    except Exception:
+        pass
+
+    # Create it
+    try:
+        msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=build_leaderboard_text(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        LEADERBOARD_MSG.clear()
+        LEADERBOARD_MSG.update({"chat_id": chat_id, "message_id": msg.message_id})
+        _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
+        return (chat_id, msg.message_id)
+    except Exception as e:
+        log.warning("Failed to create leaderboard message: %s", e)
+        return None
+
 async def leaderboard_loop(app: Application) -> None:
     if not LEADERBOARD_ON:
         return
@@ -770,12 +847,15 @@ def build_startgroup() -> str:
 def start_text() -> str:
     # Keep this as a single valid string (Railway will crash if a quote is left open).
     return (
-        f"🎩 Welcome to the {BOT_BRAND} Buy Bot! 🎩\n\n"
-        "To enjoy the benefits of the fastest Buy Notifications, Premium Trending, and Community Trending, "
-        "please add the bot to your group and follow the instructions.\n\n"
-        "Note: Bot must be an Admin with write permissions. If no confirmation message appears after adding the bot "
-        "to your community chat, simply type /continue in your group!"
+        "🎃 Welcome to the Mythic PumpTools!\n\n"
+        "Unlock Mythic-fast Buy Alerts, Premium Trending, and ads for your token.\n\n"
+        "✅ How to activate:\n"
+        " 1. Add  to your group\n"
+        " 2. Make the bot Admin with Write permissions\n"
+        " 3. If you don’t see the setup message after adding, type /continue in your group\n\n"
+        "⚡️ Ready to boost your hype? Let’s go."
     )
+
 
 
 
@@ -1061,10 +1141,205 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         return
 
+    # ----- Booking flows (Trending / Ads) -----
+    if data == "trmain":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬇️ Top 3 ⬇️", callback_data="trcat|top3"),
+            InlineKeyboardButton("⬇️ Top 10 ⬇️", callback_data="trcat|top10"),
+        ]])
+        await q.message.edit_text("<pre>📈 PumpTools Trending - Book a Slot\n\nSelect category:</pre>", parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("trcat|"):
+        _, cat = data.split("|", 1)
+        if cat not in ("top3","top10"): return
+        if cat == "top3":
+            rows = [
+                [InlineKeyboardButton("2 hours | 0.14 SOL", callback_data="trdur|top3|2h")],
+                [InlineKeyboardButton("3 hours | 0.73 SOL", callback_data="trdur|top3|3h")],
+                [InlineKeyboardButton("6 hours | 1.47 SOL", callback_data="trdur|top3|6h")],
+                [InlineKeyboardButton("12 hours | 2.03 SOL", callback_data="trdur|top3|12h")],
+                [InlineKeyboardButton("24 hours | 2.92 SOL", callback_data="trdur|top3|24h")],
+            ]
+        else:
+            rows = [
+                [InlineKeyboardButton("3 hours | 0.46 SOL", callback_data="trdur|top10|3h")],
+                [InlineKeyboardButton("6 hours | 1.09 SOL", callback_data="trdur|top10|6h")],
+                [InlineKeyboardButton("12 hours | 1.37 SOL", callback_data="trdur|top10|12h")],
+                [InlineKeyboardButton("24 hours | 2.19 SOL", callback_data="trdur|top10|24h")],
+            ]
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data="trmain"), InlineKeyboardButton("🏠 Main Menu", callback_data="mainmenu")])
+        await q.message.edit_text("<pre>Top packages (prices already -30%)\n\nButtons:</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("trdur|"):
+        _, cat, dur = data.split("|", 2)
+        price = (TOP3_PRICE_MAP if cat=="top3" else TOP10_PRICE_MAP).get(dur)
+        if price is None:
+            await q.message.reply_text("Invalid package.")
+            return
+        context.user_data["booking_flow"] = {"kind":"trending","slot":cat,"duration":dur,"price":float(price)}
+        context.user_data["awaiting_booking_mint"] = True
+        await q.message.reply_text("Send token mint address:")
+        return
+
+    if data.startswith("adsdur|"):
+        _, dur = data.split("|", 1)
+        price = ADS_PACKAGE_MAP.get(dur)
+        if price is None:
+            await q.message.reply_text("Invalid package.")
+            return
+        context.user_data["booking_flow"] = {"kind":"ads","duration":dur,"price":float(price)}
+        context.user_data["awaiting_booking_mint"] = True
+        await q.message.reply_text("Send token mint address:")
+        return
+
+    if data.startswith("paid|"):
+        _, inv_id = data.split("|", 1)
+        inv = INVOICES.get(inv_id)
+        if not inv or inv.get("status") != "pending":
+            await q.message.reply_text("Invoice not found / already processed.")
+            return
+        try:
+            txs = helius_get_transactions_by_address(PAY_WALLET, limit=50)
+            matched = None
+            for tx in txs:
+                memo = (_extract_memo_from_tx(tx) or "").strip()
+                if memo == inv_id:
+                    matched = tx
+                    break
+            if not matched:
+                await q.message.reply_text("Not found yet. Try again in 30s. If your wallet can’t add memo, use /confirm <REF> <tx_signature>.")
+                return
+            total_in = 0.0
+            for nt in matched.get("nativeTransfers") or []:
+                if nt.get("toUserAccount") == PAY_WALLET:
+                    total_in += _amount_to_sol(nt.get("amount"))
+            if total_in + 1e-9 < float(inv.get("price_sol") or 0):
+                await q.message.reply_text("Payment amount is less than required.")
+                return
+            payer = matched.get("feePayer") or ""
+            _activate_booking(inv, matched.get("signature") or "", payer)
+            if inv.get("kind") == "ads":
+                ad = inv.get("ad") or {}
+                if ad.get("text") and ad.get("link"): 
+                    ADS[inv["mint"]] = {"text": ad["text"], "link": ad["link"], "media_type": ad.get("media_type"), "media_file_id": ad.get("media_file_id"), "added_by": "paid"}
+                    save_ads()
+            if LEADERBOARD_ON and TRENDING_POST_CHAT_ID:
+                ref = await ensure_leaderboard_message(context.application)
+                if ref:
+                    chat_id, mid = ref
+                    await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode="HTML", disable_web_page_preview=True)
+            sym = TOKENS.get(inv.get("mint"), {}).get("symbol", "TOKEN")
+            await q.message.reply_text(f"✅ {inv.get('kind','').title()} activated for ${sym} ({inv.get('duration_key')}).")
+        except Exception as e:
+            await q.message.reply_text(f"Error verifying tx: {e}")
+        return
+
+    if data.startswith("cancel|"):
+        _, inv_id = data.split("|", 1)
+        inv = INVOICES.get(inv_id)
+        if inv and inv.get("status") == "pending":
+            inv["status"] = "expired"
+            _save_json(INVOICES_FILE, INVOICES)
+        await q.message.reply_text("❌ Canceled.")
+        return
+
+    if data == "mainmenu":
+        await q.message.reply_text("Use /trending or /ads to book.")
+        return
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not msg.text:
+    if not msg:
+        return
+
+    text_in = msg.text or (msg.caption or "")
+    if not text_in and not (msg.photo or msg.video or msg.animation):
+        return
+
+    # --- Interactive booking flow state machine ---
+    if context.user_data.get("awaiting_booking_mint") and text_in:
+        mint = text_in.strip()
+        flow = context.user_data.get("booking_flow") or {}
+        if mint not in TOKENS:
+            await msg.reply_text("Unknown mint. Ask owner to add it first, or send a valid tracked mint.")
+            return
+        kind = flow.get("kind")
+        dur = flow.get("duration")
+        price = float(flow.get("price") or 0)
+        if kind == "ads":
+            flow["mint"] = mint
+            context.user_data["booking_flow"] = flow
+            context.user_data.pop("awaiting_booking_mint", None)
+            context.user_data["awaiting_ad_content"] = True
+            await msg.reply_text("Send ad text + link (format: text | https://link). You can also send an image/video with the caption in that format.")
+            return
+        inv = _mk_invoice_ref("trending", mint, dur, price, update.effective_chat.id, update.effective_user.id)
+        sym = TOKENS.get(mint, {}).get("symbol") or "TOKEN"
+        slot = flow.get("slot", "top10")
+        summary = (
+            "✅ Order Summary\n\n"
+            f"Token: ${sym}\n"
+            f"Slot: {'Top 3' if slot=='top3' else 'Top 10'}\n"
+            f"Duration: {dur}\n"
+            f"Price: {price} SOL\n\n"
+            f"Pay to (Solana):\n{PAY_WALLET}\n\n"
+            f"Reference: {inv['id']}\n"
+            "(Include this reference in the transfer note/memo)\n\n"
+            "After payment tap: ✅ I Paid"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")]])
+        context.user_data.pop("awaiting_booking_mint", None)
+        await msg.reply_text(f"<pre>{html.escape(summary)}</pre>", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    if context.user_data.get("awaiting_ad_content"):
+        flow = context.user_data.get("booking_flow") or {}
+        mint = flow.get("mint")
+        if not mint:
+            context.user_data.pop("awaiting_ad_content", None)
+            await msg.reply_text("Session expired. Use /ads again.")
+            return
+        content = (text_in or '').strip()
+        if '|' in content:
+            ad_text, ad_link = [x.strip() for x in content.split('|',1)]
+        else:
+            ad_text, ad_link = content, ''
+        if not ad_link.startswith('http'):
+            await msg.reply_text("Please include a valid link. Format: your text | https://link")
+            return
+        media_type = None
+        file_id = None
+        if msg.photo:
+            media_type = 'photo'
+            file_id = msg.photo[-1].file_id
+        elif msg.video:
+            media_type = 'video'
+            file_id = msg.video.file_id
+        elif msg.animation:
+            media_type = 'animation'
+            file_id = msg.animation.file_id
+        dur = flow.get('duration')
+        price = float(flow.get('price') or 0)
+        inv = _mk_invoice_ref('ads', mint, dur, price, update.effective_chat.id, update.effective_user.id)
+        inv['ad'] = {'text': ad_text, 'link': ad_link, 'media_type': media_type, 'media_file_id': file_id}
+        _save_json(INVOICES_FILE, INVOICES)
+        context.user_data.pop('awaiting_ad_content', None)
+        sym = TOKENS.get(mint, {}).get('symbol') or 'TOKEN'
+        summary = (
+            "✅ Order Summary\n\n"
+            f"Token: ${sym}\n"
+            f"Duration: {dur}\n"
+            f"Price: {price} SOL\n\n"
+            f"Pay to (Solana):\n{PAY_WALLET}\n\n"
+            f"Reference: {inv['id']}\n"
+            "(Include this reference in the transfer note/memo)\n\n"
+            "After payment tap: ✅ I Paid"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Paid", callback_data=f"paid|{inv['id']}"), InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{inv['id']}")]])
+        await msg.reply_text(f"<pre>{html.escape(summary)}</pre>", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
         return
     txt = msg.text.strip()
 
@@ -1299,6 +1574,75 @@ async def cmd_deltoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _save_json(BOOKINGS_FILE, BOOKINGS)
     await update.effective_message.reply_text("✅ Removed.")
 
+
+
+async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text("Usage: /force_trending <mint> <duration> (example: 6h)")
+        return
+    mint = context.args[0].strip(); dur = context.args[1].strip().lower()
+    if mint not in TOKENS:
+        await update.effective_message.reply_text("Unknown mint.")
+        return
+    seconds = duration_key_to_seconds(dur)
+    BOOKINGS.setdefault('trending', {})
+    BOOKINGS['trending'][mint] = {'mint': mint, 'started_at': _now(), 'expires_at': _now()+seconds, 'paid_by': 'owner', 'tx': 'owner', 'duration_key': dur, 'price_sol': 0}
+    _save_json(BOOKINGS_FILE, BOOKINGS)
+    if LEADERBOARD_ON and TRENDING_POST_CHAT_ID:
+        ref = await ensure_leaderboard_message(context.application)
+        if ref:
+            chat_id, mid = ref
+            await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode='HTML', disable_web_page_preview=True)
+    await update.effective_message.reply_text("✅ Trending added by owner.")
+
+
+async def cmd_force_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    if len(context.args) < 3:
+        await update.effective_message.reply_text("Usage: /force_ads <mint> <duration> <text | link>")
+        return
+    mint = context.args[0].strip(); dur = context.args[1].strip().lower(); rest = ' '.join(context.args[2:]).strip()
+    if mint not in TOKENS:
+        await update.effective_message.reply_text("Unknown mint.")
+        return
+    if '|' not in rest:
+        await update.effective_message.reply_text("Format: text | https://link")
+        return
+    ad_text, ad_link = [x.strip() for x in rest.split('|',1)]
+    if not ad_link.startswith('http'):
+        await update.effective_message.reply_text("Invalid link.")
+        return
+    ADS[mint] = {'text': ad_text, 'link': ad_link, 'added_by': 'owner'}
+    save_ads()
+    seconds = duration_key_to_seconds(dur)
+    BOOKINGS.setdefault('ads', {})
+    BOOKINGS['ads'][mint] = {'mint': mint, 'started_at': _now(), 'expires_at': _now()+seconds, 'paid_by': 'owner', 'tx': 'owner', 'duration_key': dur, 'price_sol': 0}
+    _save_json(BOOKINGS_FILE, BOOKINGS)
+    await update.effective_message.reply_text("✅ Ads activated by owner.")
+
+
+async def cmd_leaderboard_init(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    ref = await ensure_leaderboard_message(context.application)
+    if not ref:
+        await update.effective_message.reply_text("Failed. Check TRENDING_POST_CHAT_ID and bot admin permissions in channel.")
+        return
+    await update.effective_message.reply_text("✅ Leaderboard message created/linked.")
+
+
+async def cmd_leaderboard_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    LEADERBOARD_MSG.clear(); _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
+    ref = await ensure_leaderboard_message(context.application)
+    if ref:
+        chat_id, mid = ref
+        await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode='HTML', disable_web_page_preview=True)
+    await update.effective_message.reply_text("✅ Leaderboard reset.")
 async def cmd_adset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -1356,7 +1700,7 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if price is None:
             await update.effective_message.reply_text("Invalid duration.\n\nAvailable:\n" + _pricing_text("trending"))
             return
-        inv = _mk_invoice("trending", mint, dur, float(price), update.effective_chat.id, update.effective_user.id)
+        inv = _mk_invoice_ref("trending", mint, dur, float(price), update.effective_chat.id, update.effective_user.id)
         await update.effective_message.reply_text(
             "🔥 <b>Trending booking</b>\n\n"
             f"Token: <code>{mint}</code>\n"
@@ -1372,11 +1716,12 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await update.effective_message.reply_text(
-        "🔥 <b>Book Trending</b>\n\n"
-        "Use:\n"
-        "<code>/trending &lt;mint&gt; &lt;duration&gt;</code>\n\n"
-        "Pricing:\n" + html.escape(_pricing_text("trending")),
-        parse_mode="HTML"
+        "<pre>📈 PumpTools Trending - Book a Slot\\n\\nSelect category:</pre>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬇️ Top 3 ⬇️", callback_data="trcat|top3"),
+            InlineKeyboardButton("⬇️ Top 10 ⬇️", callback_data="trcat|top10"),
+        ]])
     )
 
 async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1396,7 +1741,7 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if price is None:
             await update.effective_message.reply_text("Invalid duration.\n\nAvailable:\n" + _pricing_text("ads"))
             return
-        inv = _mk_invoice("ads", mint, dur, float(price), update.effective_chat.id, update.effective_user.id)
+        inv = _mk_invoice_ref("ads", mint, dur, float(price), update.effective_chat.id, update.effective_user.id)
         await update.effective_message.reply_text(
             "📣 <b>Ads booking</b>\n\n"
             f"Token: <code>{mint}</code>\n"
@@ -1412,11 +1757,16 @@ async def cmd_ads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.effective_message.reply_text(
-        "📣 <b>Book Ads</b>\n\n"
-        "Use:\n"
-        "<code>/ads &lt;mint&gt; &lt;duration&gt;</code>\n\n"
-        "Pricing:\n" + html.escape(_pricing_text("ads")),
-        parse_mode="HTML"
+        "<pre>📣 PumpTools Ads (shown under buy alerts)\\n\\nChoose duration:</pre>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("6H | 1 SOL", callback_data="adsdur|6h"),
+            InlineKeyboardButton("12H | 1.5 SOL", callback_data="adsdur|12h"),
+            InlineKeyboardButton("24H | 3 SOL", callback_data="adsdur|24h"),
+        ],[
+            InlineKeyboardButton("⬅ Back", callback_data="mainmenu"),
+            InlineKeyboardButton("🏠 Main Menu", callback_data="mainmenu"),
+        ]])
     )
 
 async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
