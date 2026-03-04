@@ -917,6 +917,151 @@ def _settings_keyboard(mint: str) -> InlineKeyboardMarkup:
     ])
 
 
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard callback presses."""
+    q = update.callback_query
+    if not q:
+        return
+    data = (q.data or "").strip()
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    # ----- Pair selection during setup -----
+    if data.startswith("pair|"):
+        _, arg = data.split("|", 1)
+        if arg == "back":
+            context.user_data["awaiting_ca"] = True
+            context.user_data.pop("pending_mint", None)
+            context.user_data.pop("pair_candidates", None)
+            await q.message.reply_text("➤ Send your SOL Contract Address:")
+            return
+
+        try:
+            idx = int(arg)
+        except Exception:
+            return
+
+        pairs = context.user_data.get("pair_candidates") or []
+        mint = context.user_data.get("pending_mint")
+        if not mint or idx < 0 or idx >= len(pairs):
+            await q.message.reply_text("Selection expired. Send the SOL Contract Address again.")
+            context.user_data["awaiting_ca"] = True
+            return
+
+        p = pairs[idx]
+        base = (p.get("baseToken") or {})
+        sym = base.get("symbol") or "TOKEN"
+        name = base.get("name") or sym
+        pair_addr = p.get("pairAddress") or ""
+
+        TOKENS[mint] = {
+            **(TOKENS.get(mint) or {}),
+            "mint": mint,
+            "symbol": sym,
+            "name": name,
+            "pair": pair_addr,
+            "chart": f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else f"https://dexscreener.com/solana/{mint}",
+            "watch_address": (TOKENS.get(mint) or {}).get("watch_address", ""),
+            "kind": "solana",
+        }
+        save_tokens()
+
+        gid = context.user_data.get("setup_group_id")
+        if gid:
+            _group_token_settings(gid, mint)
+            save_groups()
+
+        context.user_data.pop("awaiting_ca", None)
+        context.user_data.pop("pair_candidates", None)
+        context.user_data.pop("pending_mint", None)
+
+        await q.message.reply_text(
+            "⚙️ Choose from the following options to customize your Buy Bot:",
+            reply_markup=_settings_keyboard(mint),
+        )
+        return
+
+    # ----- Settings callbacks -----
+    if data.startswith("cfg|"):
+        parts = data.split("|")
+        if len(parts) >= 2 and parts[1] == "back":
+            context.user_data["awaiting_ca"] = True
+            await q.message.reply_text("➤ Send your SOL Contract Address:")
+            return
+
+        if len(parts) < 3:
+            return
+        mint = parts[1]
+        action = parts[2]
+        gid = context.user_data.get("setup_group_id")
+        if gid and mint:
+            _group_token_settings(gid, mint)
+
+        if action == "emoji":
+            context.user_data["awaiting_setting"] = {"kind": "emoji", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send the emoji you want to use (example: 🎩)")
+            return
+
+        if action == "supply":
+            context.user_data["awaiting_setting"] = {"kind": "supply", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send total supply number (example: 1000000000)")
+            return
+
+        if action == "minbuy":
+            context.user_data["awaiting_setting"] = {"kind": "minbuy", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send minimum buy in USD (example: 15)")
+            return
+
+        if action == "steps":
+            context.user_data["awaiting_setting"] = {"kind": "steps", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send buy steps in USD, comma separated (example: 15,50,100)")
+            return
+
+        if action == "media":
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_media"] = not bool(s.get("show_media", True))
+                save_groups()
+            context.user_data["awaiting_setting"] = {"kind": "mediafile", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send a photo/video/GIF for media (or type 'remove' to clear).")
+            return
+
+        if action == "chart":
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_chart"] = not bool(s.get("show_chart", True))
+                save_groups()
+            await q.message.reply_text("✅ Chart setting updated.", reply_markup=_settings_keyboard(mint))
+            return
+
+        if action == "notif":
+            if gid:
+                s = _group_token_settings(gid, mint)
+                s["show_notifications"] = not bool(s.get("show_notifications", True))
+                save_groups()
+            await q.message.reply_text("✅ Notifications setting updated.", reply_markup=_settings_keyboard(mint))
+            return
+
+        if action == "socials":
+            context.user_data["awaiting_setting"] = {"kind": "socials", "mint": mint, "group_id": gid}
+            await q.message.reply_text("Send socials like: tg=https://t.me/yourchat website=https://site.com x=https://x.com/name")
+            return
+
+        if action == "delete":
+            if gid:
+                g = GROUPS.get(str(gid)) or {}
+                tmap = g.get("tokens") or {}
+                if mint in tmap:
+                    tmap.pop(mint, None)
+                    save_groups()
+            await q.message.reply_text("🗑️ Token removed from this group.")
+            return
+
+        return
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
@@ -997,6 +1142,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             save_tokens()
             context.user_data.pop("awaiting_setting", None)
             await msg.reply_text("✅ Socials updated.", reply_markup=_settings_keyboard(mint))
+            return
+
+        if kind == "supply":
+            try:
+                val = float(txt.replace(",", "").strip())
+            except Exception:
+                await msg.reply_text("Send a number like 1000000000")
+                return
+            t = TOKENS.get(mint) or {}
+            t["total_supply"] = val
+            TOKENS[mint] = t
+            save_tokens()
+            context.user_data.pop("awaiting_setting", None)
+            await msg.reply_text("✅ Total supply updated.", reply_markup=_settings_keyboard(mint))
             return
 
     # Setup flow: contract address input
