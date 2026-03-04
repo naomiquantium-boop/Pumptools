@@ -1193,9 +1193,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 [InlineKeyboardButton("24 hours | 2.19 SOL", callback_data="trdur|top10|24h")],
             ]
         rows.append([InlineKeyboardButton("⬅ Back", callback_data="trmain"), InlineKeyboardButton("🏠 Main Menu", callback_data="mainmenu")])
-        await q.message.edit_text("<pre>Top packages (prices already -30%)
-
-Buttons:</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.edit_text("<pre>Top packages (prices already -30%)\n\nButtons:</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("trdur|"):
