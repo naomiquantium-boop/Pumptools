@@ -559,6 +559,62 @@ def _pick_spent_from_swap(ev: Dict[str, Any]) -> Tuple[float,str]:
     if best[0] > 0:
         return (best[1], best[2])
     return (0.0, "SOL")
+
+def _pick_spent_from_tx(tx: Dict[str, Any], ev: Dict[str, Any]) -> Tuple[float, str]:
+    """Best-effort spend currency/amount.
+    Prefer tokenTransfers/nativeTransfers because Jupiter/WSOL routes often make ev.nativeInput misleading."""
+    fee_payer = tx.get("feePayer") or ""
+    # 1) Prefer tokenTransfers out of fee payer for known spend mints
+    transfers = tx.get("tokenTransfers") or []
+    spend_candidates: List[Tuple[int, float, str]] = []  # (priority, amount, sym)
+    for t in transfers:
+        frm = t.get("fromUserAccount") or t.get("fromAccount") or ""
+        if fee_payer and frm != fee_payer:
+            continue
+        mint = t.get("mint") or ""
+        try:
+            amt = float(t.get("tokenAmount") or 0.0)
+        except Exception:
+            amt = 0.0
+        if amt <= 0:
+            continue
+        if mint == WSOL_MINT:
+            spend_candidates.append((4, amt, "WSOL"))
+        elif mint == USDC_MINT:
+            spend_candidates.append((3, amt, "USDC"))
+        elif mint == USDT_MINT:
+            spend_candidates.append((3, amt, "USDT"))
+        else:
+            # sometimes SOL is wrapped/unwrapped; keep as low priority
+            sym = (t.get("symbol") or mint[:4]).upper()
+            spend_candidates.append((1, amt, sym))
+    if spend_candidates:
+        spend_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        pr, amt, sym = spend_candidates[0]
+        return (amt, sym)
+
+    # 2) Fallback to swap event tokenInputs/nativeInput
+    amt, sym = _pick_spent_from_swap(ev)
+    if amt and sym:
+        return (amt, sym)
+
+    # 3) Fallback: nativeTransfers outflow from fee payer (SOL)
+    ntrs = tx.get("nativeTransfers") or []
+    out_lamports = 0
+    for nt in ntrs:
+        frm = nt.get("fromUserAccount") or ""
+        if fee_payer and frm != fee_payer:
+            continue
+        try:
+            out_lamports = max(out_lamports, int(nt.get("amount") or 0))
+        except Exception:
+            pass
+    if out_lamports:
+        return (_amount_to_sol(out_lamports), "SOL")
+
+    return (0.0, "SOL")
+
+
 def _amount_to_sol(lamports: Any) -> float:
     try:
         return float(lamports) / LAMPORTS_PER_SOL
@@ -614,7 +670,7 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
     token_outputs = ev.get("tokenOutputs") or []
     native_in = (ev.get("nativeInput") or {}).get("amount")
     buyer_fp = tx.get("feePayer") or ""
-    spent_amt, spent_sym = _pick_spent_from_swap(ev)
+    spent_amt, spent_sym = _pick_spent_from_tx(tx, ev)
     sol_in = spent_amt  # kept for backwards compatibility
 
     out_amt = None
@@ -867,8 +923,8 @@ def _num_emoji(n: int) -> str:
         1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣",10:"🔟"
     }.get(n, str(n))
 
-def build_leaderboard_text() -> str:
-    """Leaderboard style like SpyTON: top 3, divider, then 4-10 with % change."""
+def build_leaderboard_html() -> str:
+    """Leaderboard (SpyTON style) without code block; token symbols clickable to their Telegram if set."""
     _clean_expired()
 
     # Rank: booked first, then organic by 6h volume
@@ -890,165 +946,67 @@ def build_leaderboard_text() -> str:
             except Exception:
                 pass
         vols.sort(reverse=True)
-        ranked += [mint for _, mint in vols]
+        for _, mint in vols:
+            ranked.append(mint)
 
     ranked = ranked[:10]
-    while len(ranked) < 10:
-        ranked.append("")
 
-    handle = LEADERBOARD_HEADER_HANDLE or "@PumpToolsTrending"
-    lines: List[str] = [f"🟢 {handle}"]
+    def sym_link(mint: str) -> str:
+        sym = (TOKENS.get(mint, {}) or {}).get("symbol") or mint[:4]
+        tg = ((TOKENS.get(mint, {}) or {}).get("socials") or {}).get("tg") or ""
+        if tg and tg.startswith("@"):
+            tg = "https://t.me/" + tg[1:]
+        if tg and not tg.startswith("http"):
+            tg = "https://" + tg
+        if tg:
+            return f'<a href="{html.escape(tg)}">${html.escape(sym)}</a>'
+        return f'${html.escape(sym)}'
 
-    # compute pct from stored baseline mcap
-    changed = False
-    for i in range(1, 11):
-        mint = ranked[i-1]
-        if mint and mint in TOKENS:
-            sym = TOKENS[mint].get("symbol") or "SYMBOL"
-            md = get_market_data(mint)
-            mcap = md.get("marketCap") or md.get("fdv") or 0
-            try:
-                mcap = float(mcap or 0)
-            except Exception:
-                mcap = 0.0
-            base = TOKENS[mint].get("lb_base_mcap")
-            if (base is None or float(base or 0) <= 0) and mcap > 0:
-                TOKENS[mint]["lb_base_mcap"] = mcap
-                base = mcap
-                changed = True
-            try:
-                base_f = float(base or 0)
-            except Exception:
-                base_f = 0.0
-            pct = 0.0
-            if base_f > 0 and mcap > 0:
-                pct = (mcap - base_f) / base_f * 100.0
-            pct_str = f"{pct:+.0f}%"
-            lines.append(f"{_num_emoji(i)}  -  ${sym} | {pct_str}")
-        else:
-            lines.append(f"{_num_emoji(i)}  -  $SYMBOL | +0%")
-        if i == 3:
-            lines.append("----------------------------------------")
+    lines: List[str] = []
+    header = LEADERBOARD_HEADER_HANDLE or "@PumpToolsTrending"
+    lines.append(f"🟢 {html.escape(header)}")
+    if not ranked:
+        lines.append("")
+        lines.append("No tokens yet.")
+        return "\n".join(lines)
 
-    if changed:
-        _save_json(TOKENS_FILE, TOKENS)
-
-    return "<pre>\n" + "\n".join(lines) + "\n</pre>"
-
-
-async def ensure_leaderboard_message(app: Application) -> Optional[Tuple[int,int]]:
-    """Ensure a single leaderboard message exists in the trending channel and return (chat_id, message_id).
-    Stores the reference in LEADERBOARD_MSG_FILE so we edit the same message (no spam)."""
-    if not TRENDING_POST_CHAT_ID:
-        return None
-    chat_id = await get_trending_chat_id(app)
-    if not chat_id:
-        return None
-
-    # If we already have a message id, use it
-    try:
-        mid = int((LEADERBOARD_MSG or {}).get("message_id") or 0)
-        cid = int((LEADERBOARD_MSG or {}).get("chat_id") or 0)
-        if mid and cid == chat_id:
-            return (chat_id, mid)
-    except Exception:
-        pass
-
-    # Create it
-    try:
-        msg = await app.bot.send_message(
-            chat_id=chat_id,
-            text=build_leaderboard_text(),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
-            disable_web_page_preview=True,
-        )
-        LEADERBOARD_MSG.clear()
-        LEADERBOARD_MSG.update({"chat_id": chat_id, "message_id": msg.message_id})
-        _save_json(LEADERBOARD_MSG_FILE, LEADERBOARD_MSG)
-        return (chat_id, msg.message_id)
-    except Exception as e:
-        log.warning("Failed to create leaderboard message: %s", e)
-        return None
-
-
-async def maybe_init_leaderboard(app):
-    """Create leaderboard message once (if TRENDING_POST_CHAT_ID is set) and store message_id."""
-    try:
-        chat_id = TRENDING_POST_CHAT_ID
-        if not chat_id:
-            return
-        # If already saved, skip
-        lb = _load_json(LEADERBOARD_MSG_FILE, default={})
-        if lb.get("chat_id") == str(chat_id) and lb.get("message_id"):
-            return
-        # Create a placeholder leaderboard message
-        text = render_leaderboard()
-        msg = await app.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
-        _save_json(LEADERBOARD_MSG_FILE, {"chat_id": str(chat_id), "message_id": msg.message_id})
-    except Exception as e:
-        log.warning("Leaderboard init failed: %s", e)
-
-async def leaderboard_loop(app: Application) -> None:
-    if not LEADERBOARD_ON:
-        return
-    while True:
+    # helper percent change based on stored baseline mcap
+    def pct(mint: str) -> str:
+        base = (TOKENS.get(mint, {}) or {}).get("lb_base_mcap")
+        md = get_market_data(mint)
+        cur = md.get("fdv") or md.get("marketCap") or 0
         try:
-            if not TRENDING_POST_CHAT_ID:
-                await asyncio.sleep(LEADERBOARD_INTERVAL)
-                continue
-            ref = await ensure_leaderboard_message(app)
-            if not ref:
-                await asyncio.sleep(LEADERBOARD_INTERVAL)
-                continue
-            chat_id, mid = ref
-            await app.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=mid,
-                text=build_leaderboard_text(),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(LEADERBOARD_BUTTON_TEXT, url=LISTING_URL)]]),
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.warning("leaderboard_loop error: %s", e)
-        await asyncio.sleep(LEADERBOARD_INTERVAL)
-
-
-
-# -------------------- CHAT ID RESOLUTION --------------------
-_TRENDING_CHAT_ID_CACHE: Optional[int] = None
-
-async def resolve_chat_id(app: Application, chat_ref: Any) -> Optional[int]:
-    """Resolve chat id from an int-like value or @username / t.me link."""
-    if chat_ref is None:
-        return None
-    try:
-        return int(chat_ref)
-    except Exception:
-        pass
-    s = str(chat_ref).strip()
-    if not s:
-        return None
-    if "t.me/" in s:
-        s = s.split("t.me/")[-1].split("/")[0]
-        s = "@" + s.lstrip("@")
-    if s.startswith("@"):
-        try:
-            chat = await app.bot.get_chat(s)
-            return int(chat.id)
+            cur = float(cur) if cur else 0.0
         except Exception:
-            return None
-    return None
+            cur = 0.0
+        if not base:
+            # set baseline
+            if cur:
+                TOKENS[mint]["lb_base_mcap"] = cur
+                save_tokens()
+            return "+0%"
+        try:
+            basef = float(base)
+            if basef <= 0 or cur <= 0:
+                return "+0%"
+            p = (cur - basef) / basef * 100.0
+            sign = "+" if p >= 0 else ""
+            return f"{sign}{p:.0f}%"
+        except Exception:
+            return "+0%"
 
-async def get_trending_chat_id(app: Application) -> Optional[int]:
-    global _TRENDING_CHAT_ID_CACHE
-    if _TRENDING_CHAT_ID_CACHE:
-        return _TRENDING_CHAT_ID_CACHE
-    cid = await resolve_chat_id(app, TRENDING_POST_CHAT_ID)
-    _TRENDING_CHAT_ID_CACHE = cid
-    return cid
-# -------------------- CONFIG LOAD --------------------
+    # Top 3
+    for i, mint in enumerate(ranked[:3], start=1):
+        lines.append(f"{num_emoji(i)}  – {sym_link(mint)} | {pct(mint)}")
+
+    # Divider then rest
+    if len(ranked) > 3:
+        lines.append("----------------------------------------")
+        for i, mint in enumerate(ranked[3:], start=4):
+            lines.append(f"{num_emoji(i)}  – {sym_link(mint)} | {pct(mint)}")
+
+    return "\n".join(lines)
+
 def load_all() -> None:
     global TOKENS, GROUPS, SEEN, ADS, BOOKINGS, INVOICES, LEADERBOARD_MSG
     TOKENS = {t["mint"]: t for t in _load_json(TOKENS_FILE, []) if isinstance(t, dict) and t.get("mint")}
@@ -1501,7 +1459,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ref = await ensure_leaderboard_message(context.application)
                 if ref:
                     chat_id, mid = ref
-                    await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode="HTML", disable_web_page_preview=True)
+                    await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_html(), parse_mode="HTML", disable_web_page_preview=True)
             sym = TOKENS.get(inv.get("mint"), {}).get("symbol", "TOKEN")
             await q.message.reply_text(f"✅ {inv.get('kind','').title()} activated for ${sym} ({inv.get('duration_key')}).")
         except Exception as e:
@@ -1881,7 +1839,7 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ref = await ensure_leaderboard_message(context.application)
         if ref:
             chat_id, mid = ref
-            await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode='HTML', disable_web_page_preview=True)
+            await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_html(), parse_mode='HTML', disable_web_page_preview=True)
     await update.effective_message.reply_text("✅ Trending added by owner.")
 
 
@@ -1926,7 +1884,7 @@ async def cmd_leaderboard_reset(update: Update, context: ContextTypes.DEFAULT_TY
     ref = await ensure_leaderboard_message(context.application)
     if ref:
         chat_id, mid = ref
-        await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_text(), parse_mode='HTML', disable_web_page_preview=True)
+        await context.application.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=build_leaderboard_html(), parse_mode='HTML', disable_web_page_preview=True)
     await update.effective_message.reply_text("✅ Leaderboard reset.")
 async def cmd_adset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
