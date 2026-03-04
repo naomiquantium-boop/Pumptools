@@ -83,12 +83,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 # Solana / Helius
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
-# Helius Enhanced API base (NOT the RPC base). The enhanced endpoint we use is:
-#   GET https://api.helius.xyz/v0/addresses/<address>/transactions?api-key=...
-# Many people mistakenly use the RPC hostname (api-mainnet.helius-rpc.com),
-# which will NEVER work with /v0/addresses endpoints.
 HELIUS_BASE = os.getenv("HELIUS_BASE", "https://api.helius.xyz").strip().rstrip("/")
 POLL_INTERVAL = max(2.0, float(os.getenv("POLL_INTERVAL", "2.0")))
+# Payment scanning (booking/ads) should be much slower than buy polling to avoid Helius 429.
+PAYMENT_POLL_INTERVAL = max(10.0, float(os.getenv("PAYMENT_POLL_INTERVAL", "20.0")))
+HELIUS_BACKOFF_BASE = max(5.0, float(os.getenv("HELIUS_BACKOFF_BASE", "10.0")))
 BURST_WINDOW_SEC = int(os.getenv("BURST_WINDOW_SEC", "30"))
 
 # Channels
@@ -244,16 +243,36 @@ _last_ad_rotation_ts = 0.0
 _ad_rotation_idx = 0
 
 # -------------------- SOLANA / HELIUS --------------------
+_HELIUS_COOLDOWN_UNTIL = 0.0
+_HELIUS_BACKOFF_MULT = 1.0
 def helius_get_transactions_by_address(address: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Fetch latest txs for an address via Helius enhanced API with backoff on 429."""
+    global _HELIUS_COOLDOWN_UNTIL, _HELIUS_BACKOFF_MULT
+    if not HELIUS_API_KEY or not address:
+        return []
+    now = time.time()
+    if now < _HELIUS_COOLDOWN_UNTIL:
+        return []
+
     # Docs: GET /v0/addresses/{address}/transactions?api-key=...
     url = f"{HELIUS_BASE}/v0/addresses/{address}/transactions"
     params = {"api-key": HELIUS_API_KEY, "limit": str(limit)}
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list):
-        return data
-    return []
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code == 429:
+            _HELIUS_BACKOFF_MULT = min(8.0, _HELIUS_BACKOFF_MULT * 1.6)
+            wait = HELIUS_BACKOFF_BASE * _HELIUS_BACKOFF_MULT
+            _HELIUS_COOLDOWN_UNTIL = time.time() + wait
+            log.warning("Helius 429 rate limit. Cooling down for %.1fs", wait)
+            return []
+        r.raise_for_status()
+        _HELIUS_BACKOFF_MULT = 1.0
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning("Helius request failed: %s", e)
+        _HELIUS_COOLDOWN_UNTIL = time.time() + 5
+        return []
 
 def _short(addr: str, n: int = 4) -> str:
     if not addr:
@@ -447,7 +466,7 @@ async def poll_payments(app: Application) -> None:
     while True:
         try:
             _clean_expired()
-            txs = helius_get_transactions_by_address(PAY_WALLET, limit=25)
+            txs = helius_get_transactions_by_address(PAY_WALLET, limit=10)
             # newest first -> process old to new
             for tx in reversed(txs):
                 sig = tx.get("signature") or ""
@@ -479,7 +498,7 @@ async def poll_payments(app: Application) -> None:
             _save_json(SEEN_FILE, SEEN)
         except Exception as e:
             log.warning("poll_payments error: %s", e)
-        await asyncio.sleep(max(4.0, POLL_INTERVAL))
+        await asyncio.sleep(PAYMENT_POLL_INTERVAL)
 
 # -------------------- BUY DETECTION --------------------
 def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str, Any]]:
@@ -520,11 +539,8 @@ def parse_buy_from_tx(tx: Dict[str, Any], token_mint: str) -> Optional[Dict[str,
                     out_amt = None
                 out_user = tt.get("toUserAccount") or tt.get("userAccount")
                 break
-    if out_amt is None:
-        return None
 
-    # accept buys paid with SOL / WSOL / USDC etc.
-    if spent_amount is None or spent_amount <= 0:
+    if sol_in <= 0 or out_amt is None:
         return None
 
     return {
@@ -1316,7 +1332,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.message.reply_text("Invoice not found / already processed.")
             return
         try:
-            txs = helius_get_transactions_by_address(PAY_WALLET, limit=50)
+            txs = helius_get_transactions_by_address(PAY_WALLET, limit=15)
             matched = None
             for tx in txs:
                 memo = (_extract_memo_from_tx(tx) or "").strip()
@@ -1700,7 +1716,7 @@ async def cmd_force_trending(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_owner(update.effective_user.id):
         return
     if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /force_trending <CA> <duration> (example: 6h)")
+        await update.effective_message.reply_text("Usage: /force_trending <mint> <duration> (example: 6h)")
         return
     mint = context.args[0].strip(); dur = context.args[1].strip().lower()
     if mint not in TOKENS:
@@ -1909,7 +1925,7 @@ async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # verify tx hits PAY_WALLET and has enough SOL
     try:
         # easiest: fetch txs for pay wallet and find signature
-        txs = helius_get_transactions_by_address(PAY_WALLET, limit=50)
+        txs = helius_get_transactions_by_address(PAY_WALLET, limit=15)
         tx = next((t for t in txs if t.get("signature") == sig), None)
         if not tx:
             await update.effective_message.reply_text("Tx not found yet. Try again in 30s.")
